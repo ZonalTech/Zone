@@ -382,11 +382,8 @@ def cmd_get(args):
             ok("Dependencies installed.")
     elif not has_venv(ZONE):
         warn("Zone has no .venv (was it created with `zonal init`?). Run `zonal setup` next.")
-    ok(f"App '{name}' added to the zone.")
-    # Name the app on the command line (run from the zone — no cd needed).
-    print(f"\nNext (from the zone, no cd needed):\n"
-          f"  zonal setup {name} --seed   :: .env, install deps, init the database, add samples\n"
-          f"  zonal start {name}          :: run it (live logs + native window)")
+    ok(f"App added at apps/{name}")
+    print(f"  Set up & run it:  zonal setup {name} --seed   then   zonal start {name}")
 
 
 def _pip_install_venv(pip_args, cwd=None, quiet=False):
