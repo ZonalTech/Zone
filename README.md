@@ -13,8 +13,7 @@ zonal --version
 py -m pip install "git+https://github.com/ZonalTech/Zonal.git"
 zonal init mystore
 cd mystore
-zonal get https://github.com/ZonalTech/Zonal.git
-cd apps/zt-pos
+zonal get https://github.com/ZonalTech/<your-app>.git
 zonal setup --seed
 zonal start
 ```
@@ -29,17 +28,16 @@ cd mystore
 ## Get an app
 
 ```bat
-zonal get https://github.com/ZonalTech/Zonal.git
-zonal get <repo-url> pos
-zonal get <repo-url> --branch dev
+zonal get https://github.com/ZonalTech/<your-app>.git
+zonal get https://github.com/ZonalTech/<your-app>.git pos
+zonal get https://github.com/ZonalTech/<your-app>.git --branch dev
 ```
 
-## Set up and run
+## Set up and run (from the zone — name the app)
 
 ```bat
-cd apps/zt-pos
-zonal setup --seed
-zonal start
+zonal setup zt-pos --seed
+zonal start zt-pos
 ```
 
 ## Commands
@@ -47,12 +45,12 @@ zonal start
 ```
 zonal init [NAME]
 zonal get REPO [NAME] [--branch B]
-zonal setup [--seed] [--skip-install]
+zonal setup [APP] [--seed] [--skip-install]
 zonal install [--build]
 zonal initdb
 zonal migrate
 zonal seed
-zonal start [--port] [--host] [--no-reload] [--no-browser] [--prod]
+zonal start [APP] [--port] [--host] [--no-window]
 zonal serve [--port] [--host] [--reload] [--prod]
 zonal launch
 zonal restart

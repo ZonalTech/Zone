@@ -103,8 +103,9 @@ def resolve_app(zone, explicit=None, start=None):
         return os.path.join(ad, apps[0])
     if not apps:
         die("This zone has no apps yet — add one with:  zonal get <repo-url>")
-    die("This zone has several apps — choose one with --app:\n  "
-        + ", ".join(apps) + "\n  e.g.  zonal --app " + apps[0] + " start")
+    die("This zone has several apps — name one:\n  "
+        + ", ".join(apps) + f"\n  e.g.  zonal start {apps[0]}   "
+        f"(or add  --app {apps[0]}  to other commands)")
 
 
 def _set_zone(zone):
@@ -382,9 +383,10 @@ def cmd_get(args):
     elif not has_venv(ZONE):
         warn("Zone has no .venv (was it created with `zonal init`?). Run `zonal setup` next.")
     ok(f"App '{name}' added to the zone.")
-    print(f"\nNext:\n  cd apps/{name}\n  zonal setup --seed   "
-          f":: .env, install deps, init the database, add samples"
-          f"\n  zonal start          :: run the dev server (live logs + browser)")
+    # Name the app on the command line (run from the zone — no cd needed).
+    print(f"\nNext (from the zone, no cd needed):\n"
+          f"  zonal setup {name} --seed   :: .env, install deps, init the database, add samples\n"
+          f"  zonal start {name}          :: run it (live logs + native window)")
 
 
 def _pip_install_venv(pip_args, cwd=None, quiet=False):
@@ -506,45 +508,49 @@ def cmd_setup(args):
           "(or  zonal launch  for the desktop window)")
 
 
-def _open_browser_later(url, delay=1.5):
-    """Open the browser shortly after the server starts (non-blocking)."""
-    import threading, webbrowser
-    t = threading.Timer(delay, lambda: webbrowser.open(url))
-    t.daemon = True
-    t.start()
-    ok(f"Opening {url} …")
+def _pick_port(host, preferred):
+    """Return `preferred` if free, else an OS-assigned free port (avoids 'port in use')."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, int(preferred)))
+            return int(preferred)
+        except OSError:
+            pass
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+        s2.bind((host, 0))
+        return s2.getsockname()[1]
 
 
-def _serve(host, port, reload_, prod, serve_argv, open_browser):
-    """Shared dev-server runner for `serve` and `start` (runs in the foreground).
+def _wait_until_up(url, timeout=15.0):
+    """Poll the local server until it answers, so the window opens to a ready app."""
+    import time, urllib.request, urllib.error
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            return True
+        except urllib.error.HTTPError:
+            return True   # any HTTP response means it's up
+        except Exception:
+            time.sleep(0.3)
+    return False
 
-    With the reloader on, Werkzeug spawns a child that does the real serving;
-    only that child should write the pidfile and open the browser, so we skip
-    the parent watchdog (WERKZEUG_RUN_MAIN != "true").
-    """
-    reloader_parent = reload_ and not prod and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
-    from app import app
-    if not reloader_parent:
-        _write_pidfile(os.getpid(), serve_argv)
-        if open_browser:
-            bh = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
-            _open_browser_later(f"http://{bh}:{port}")
+
+def _serve_block(url):
+    """Keep the background server alive without a window — and WITHOUT a browser."""
+    import time
+    print(f"\nServer still running at {url} — open it manually if you like. Ctrl+C to stop.")
     try:
-        if prod:
-            head(f"Serving (waitress, production WSGI) on http://{host}:{port}")
-            from waitress import serve
-            serve(app, host=host, port=port, threads=8)
-        else:
-            head(f"Serving (Flask dev server) on http://{host}:{port}  reload={reload_}")
-            app.run(host=host, port=port, debug=reload_, use_reloader=reload_)
-    finally:
-        if PID_FILE and os.path.isfile(PID_FILE):
-            try: os.remove(PID_FILE)
-            except OSError: pass
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_serve(args):
-    """Run the Flask dev server in the browser (auto-reload only with --reload)."""
+    """Run the Flask dev server headless: logs only, no window and no browser."""
+    from app import app
     from config import Config
     host, port = args.host or Config.HOST, args.port or Config.PORT
     os.environ.setdefault("FLASK_DEBUG", "1" if args.reload else "0")
@@ -553,29 +559,87 @@ def cmd_serve(args):
     if args.host: serve_argv += ["--host", args.host]
     if args.reload: serve_argv.append("--reload")
     if args.prod: serve_argv.append("--prod")
-    _serve(host, port, args.reload, args.prod, serve_argv, open_browser=False)
+    # With the reloader on, only the serving child (not the watchdog) records the pid.
+    if not (args.reload and not args.prod and os.environ.get("WERKZEUG_RUN_MAIN") != "true"):
+        _write_pidfile(os.getpid(), serve_argv)
+    try:
+        if args.prod:
+            head(f"Serving (waitress) on http://{host}:{port}")
+            from waitress import serve
+            serve(app, host=host, port=port, threads=8)
+        else:
+            head(f"Serving (Flask dev server) on http://{host}:{port}  reload={args.reload}")
+            app.run(host=host, port=port, debug=args.reload, use_reloader=args.reload)
+    finally:
+        if PID_FILE and os.path.isfile(PID_FILE):
+            try: os.remove(PID_FILE)
+            except OSError: pass
 
 
 def cmd_start(args):
-    """Start the dev server the bench way: live logs, auto-reload, opens the app.
+    """Start the dev server with LIVE LOGS and render the app in a native desktop window.
 
-    This is the everyday `zonal start` — it stays in the foreground streaming
-    the server log, reloads on code changes, and opens the POS in your browser.
-    Ctrl+C stops it.
+    No browser: the UI opens in an embedded WebView2 window (via pywebview),
+    just like the packaged app, while the dev server's request log streams to
+    this console. The server runs on a background thread because the window must
+    own the main thread; close the window (or press Ctrl+C) to stop.
     """
-    reload_ = (not args.no_reload) and (not args.prod)
+    import threading
+    from app import app as flask_app
     from config import Config
-    host, port = args.host or Config.HOST, args.port or Config.PORT
-    os.environ.setdefault("FLASK_DEBUG", "1" if reload_ else "0")
+    host = args.host or Config.HOST
+    port = _pick_port(host, args.port or Config.PORT)
+    url_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    url = f"http://{url_host}:{port}"
+
     serve_argv = ["start"]
     if args.port: serve_argv += ["--port", str(args.port)]
     if args.host: serve_argv += ["--host", args.host]
-    if args.no_reload: serve_argv.append("--no-reload")
-    if args.no_browser: serve_argv.append("--no-browser")
-    if args.prod: serve_argv.append("--prod")
-    if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
-        head("Starting ZT POS — live logs below, press Ctrl+C to stop")
-    _serve(host, port, reload_, args.prod, serve_argv, open_browser=not args.no_browser)
+    if args.no_window: serve_argv.append("--no-window")
+    _write_pidfile(os.getpid(), serve_argv)
+
+    head(f"Starting {os.path.basename(ROOT)} — live logs below; "
+         f"close the window (or Ctrl+C) to stop")
+    print(f"  dev server: {url}")
+
+    # Serve in the background (no reloader — the window owns the main thread);
+    # the request log streams straight to this console.
+    threading.Thread(
+        target=lambda: flask_app.run(host=host, port=port, debug=False,
+                                     use_reloader=False, threaded=True),
+        daemon=True,
+    ).start()
+    _wait_until_up(url)
+
+    if args.no_window:
+        _serve_block(url)
+        return
+    try:
+        import webview
+        title = getattr(Config, "STORE_NAME", None) or os.path.basename(ROOT)
+        webview.create_window(title, url, width=1280, height=820, min_size=(1000, 680))
+        icon = None
+        try:
+            from config import resource_path
+            cand = resource_path("assets/icon.ico")
+            icon = cand if os.path.isfile(cand) else None
+        except Exception:
+            icon = None
+        try:
+            webview.start(icon=icon) if icon else webview.start()
+        except TypeError:
+            webview.start()  # older pywebview without the icon argument
+    except ImportError:
+        warn("pywebview isn't installed in this zone, so the desktop window can't open.")
+        warn("Install the app's deps with `zonal install`, then run `zonal start` again.")
+        _serve_block(url)
+    except Exception as e:
+        warn(f"Native window unavailable ({e}).")
+        _serve_block(url)
+    finally:
+        if PID_FILE and os.path.isfile(PID_FILE):
+            try: os.remove(PID_FILE)
+            except OSError: pass
 
 
 def cmd_restart(args):
@@ -592,7 +656,7 @@ def cmd_restart(args):
 def cmd_launch(args):
     """Run the full desktop app (native window via launcher.py)."""
     import launcher
-    head("Launching ZT POS desktop app")
+    head(f"Launching {os.path.basename(ROOT)} desktop app")
     launcher.serve()
 
 
@@ -904,11 +968,11 @@ def build_parser():
 
     # setup/install install into the zone venv themselves, so they don't need to
     # be re-exec'd *inside* it (needs_venv=False).
-    add("setup", cmd_setup, "Set up the app: .env, deps, database, optional seed.",
-        needs_venv=False) \
-        .add_argument("--seed", action="store_true", help="Also insert sample products.")
-    sub.choices["setup"].add_argument("--skip-install", action="store_true",
-                                      help="Skip the dependency step.")
+    sp = add("setup", cmd_setup, "Set up the app: .env, deps, database, optional seed.",
+             needs_venv=False)
+    sp.add_argument("app_name", nargs="?", help="App to set up (default: the zone's app).")
+    sp.add_argument("--seed", action="store_true", help="Also insert sample products.")
+    sp.add_argument("--skip-install", action="store_true", help="Skip the dependency step.")
     add("install", cmd_install, "Install the app's dependencies into the zone .venv.",
         needs_venv=False) \
         .add_argument("--build", action="store_true", help="Also install build deps.")
@@ -916,12 +980,13 @@ def build_parser():
     add("migrate", cmd_migrate, "Apply idempotent schema upgrades.")
     add("seed", cmd_seed, "Insert sample products.")
 
-    sp = add("start", cmd_start, "Start the dev server: live logs, reload, opens the app.")
+    sp = add("start", cmd_start,
+             "Run an app: live logs + native window.  e.g. zonal start zt-pos")
+    sp.add_argument("app_name", nargs="?", help="App to run (default: the zone's app).")
     sp.add_argument("--port", type=int, help="Port (default from config).")
     sp.add_argument("--host", help="Host (default from config).")
-    sp.add_argument("--no-reload", action="store_true", help="Disable auto-reload.")
-    sp.add_argument("--no-browser", action="store_true", help="Don't open the browser.")
-    sp.add_argument("--prod", action="store_true", help="Use the waitress WSGI server.")
+    sp.add_argument("--no-window", action="store_true",
+                    help="Don't open the desktop window; just serve with live logs.")
 
     sp = add("serve", cmd_serve, "Run the Flask dev server (browser, no auto-open).")
     sp.add_argument("--port", type=int, help="Port (default from config).")
@@ -1003,7 +1068,9 @@ def main(argv=None):
 
         if getattr(args, "needs_app", True):
             # Pick the app this command targets, move into it, import from it.
-            app_dir = resolve_app(zone, explicit=getattr(args, "app", None))
+            # Precedence: positional (e.g. `zonal start zt-pos`) > global --app > auto.
+            explicit = getattr(args, "app_name", None) or getattr(args, "app", None)
+            app_dir = resolve_app(zone, explicit=explicit)
             _set_app(app_dir)
             os.chdir(app_dir)
             if app_dir not in sys.path:
