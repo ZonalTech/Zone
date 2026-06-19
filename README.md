@@ -48,9 +48,11 @@ zone get REPO [NAME] [--branch B]
 zone setup [APP] [--seed] [--skip-install]
 zone install [--build]
 zone initdb
-zone migrate [--no-assets]
+zone migrate [APP] [--no-assets]   # app must be running (zone start)
 zone seed
-zone start [APP] [--port] [--host] [--no-window] [--no-version-check]
+zone set-db-password ["password"] [--user root]
+zone set-admin-password ["password"] [--user admin] [--require-change]
+zone start [APP] [--reload] [--port] [--host] [--no-window] [--no-version-check]
 zone serve [--port] [--host] [--reload] [--prod]
 zone launch
 zone restart

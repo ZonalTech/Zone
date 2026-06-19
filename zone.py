@@ -614,7 +614,16 @@ def cmd_initdb(args):
 
 
 def cmd_migrate(args):
-    """Apply idempotent schema upgrades and refresh static assets to the latest."""
+    """Apply schema upgrades and refresh assets — only while the app is running."""
+    # Migrate runs against a started app: require a live `zone start`/`serve`.
+    # (refresh manages the server itself, so it skips this check.)
+    if not getattr(args, "skip_running_check", False):
+        info = _read_pidfile()
+        pid = info.get("pid") if info else None
+        if not (pid and _pid_alive(pid)):
+            app = os.path.basename(ROOT)
+            die(f"App '{app}' isn't running — start it first:  zone start {app}\n"
+                f"  (migrate runs against the running app).")
     import migrate
     head("Migrating database")
     try:
@@ -639,6 +648,53 @@ def cmd_seed(args):
     import seed
     head("Seeding sample data")
     seed.run()
+
+
+def cmd_set_db_password(args):
+    """Set the MariaDB connection password (and optionally user) in the app's .env."""
+    if not os.path.isfile(_env_path()):
+        cmd_ensure_env()
+    pw = args.password
+    if pw is None:
+        import getpass
+        if not (sys.stdin and sys.stdin.isatty()):
+            die('Provide the password:  zone set-db-password "<password>"')
+        who = args.user or _read_env_value("DB_USER") or "root"
+        pw = getpass.getpass(f"MariaDB password for '{who}': ")
+    if args.user:
+        _set_env_var("DB_USER", args.user)
+    _set_env_var("DB_PASSWORD", pw)
+    shown = args.user or _read_env_value("DB_USER") or "root"
+    ok(f"Saved DB credentials to .env (user '{shown}').")
+    print("Next:  zone setup   (or  zone initdb)  to create the database with these.")
+
+
+def cmd_set_admin_password(args):
+    """Set an app login user's password (the app's 'admin' by default)."""
+    from app import app
+    from models import db, User
+    username = args.user
+    new = args.password
+    if new is None:
+        import getpass
+        if not (sys.stdin and sys.stdin.isatty()):
+            die('Provide the new password:  zone set-admin-password "<password>"')
+        new = getpass.getpass(f"New password for '{username}': ")
+        if new != getpass.getpass("Confirm new password: "):
+            die("Passwords don't match.")
+    if not new:
+        die("Password cannot be empty.")
+    head(f"Setting password for '{username}' on app '{os.path.basename(ROOT)}'")
+    with app.app_context():
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            die(f"No login user '{username}' in this app's database "
+                f"(set the app up first with `zone setup`).")
+        user.set_password(new)
+        if hasattr(user, "must_change_password"):
+            user.must_change_password = bool(args.require_change)
+        db.session.commit()
+    ok(f"Password updated for '{username}'.")
 
 
 def cmd_setup(args):
@@ -736,19 +792,54 @@ def cmd_serve(args):
             except OSError: pass
 
 
-def cmd_start(args):
-    """Start the dev server with live logs and render the app in a native desktop window.
+def _watch_app_files(root, on_change, interval=1.0):
+    """Poll the app's source files; call on_change() whenever one changes.
 
-    No browser: the UI opens in an embedded WebView2 window (via pywebview),
-    just like the packaged app, while the dev server's request log streams to
-    this console. The server runs on a background thread because the window must
-    own the main thread; close the window (or press Ctrl+C) to stop.
+    Generic for any app a zone runs — watches code/templates/static under the
+    app dir, ignoring venv/git/cache folders.
+    """
+    import time
+    exts = (".py", ".html", ".htm", ".css", ".js", ".jinja", ".jinja2", ".json")
+    skip = {".venv", ".git", "__pycache__", "node_modules", ".zone", "backups"}
+
+    def snapshot():
+        snap = {}
+        for dp, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in skip]
+            for f in files:
+                if f.endswith(exts):
+                    p = os.path.join(dp, f)
+                    try:
+                        snap[p] = os.path.getmtime(p)
+                    except OSError:
+                        pass
+        return snap
+
+    prev = snapshot()
+    while True:
+        time.sleep(interval)
+        try:
+            cur = snapshot()
+        except Exception:
+            continue
+        if cur != prev:
+            prev = cur
+            on_change()
+
+
+def cmd_start(args):
+    """Run an app in a native desktop window with live logs (and optional auto-reload).
+
+    No browser: the UI opens in an embedded WebView2 window (via pywebview) while
+    the dev server's request log streams to this console. With --reload, edits to
+    the app's code/templates/static are picked up automatically and the window
+    refreshes — works for any Flask app a zone serves. Close the window (or press
+    Ctrl+C) to stop.
     """
     import threading
     # Track the zone CLI version: show current -> latest and nudge to upgrade.
     if not args.no_version_check:
         _check_zone_update()
-    from app import app as flask_app
     from config import Config
     host = args.host or Config.HOST
     port = _pick_port(host, args.port or Config.PORT)
@@ -759,19 +850,30 @@ def cmd_start(args):
     if args.port: serve_argv += ["--port", str(args.port)]
     if args.host: serve_argv += ["--host", args.host]
     if args.no_window: serve_argv.append("--no-window")
+    if args.reload: serve_argv.append("--reload")
     _write_pidfile(os.getpid(), serve_argv)
 
     head(f"Starting {os.path.basename(ROOT)} — live logs below; "
          f"close the window (or Ctrl+C) to stop")
-    print(f"  dev server: {url}")
+    print(f"  dev server: {url}" + ("   (auto-reload on edits)" if args.reload else ""))
 
-    # Serve in the background (no reloader — the window owns the main thread);
-    # the request log streams straight to this console.
-    threading.Thread(
-        target=lambda: flask_app.run(host=host, port=port, debug=False,
-                                     use_reloader=False, threaded=True),
-        daemon=True,
-    ).start()
+    server_proc = None
+    if args.reload:
+        # Run the server as a subprocess so Werkzeug's reloader can restart it on
+        # code edits without killing the window. Reuses `zone serve --reload`,
+        # which works for any Flask app; its log streams to this console.
+        cmd = [sys.executable, os.path.abspath(__file__), "serve", "--reload",
+               "--port", str(port), "--host", host]
+        server_proc = subprocess.Popen(cmd, cwd=ROOT,
+                                       env=dict(os.environ, ZONE_IN_VENV="1"))
+    else:
+        # Serve in a daemon thread; the window owns the main thread.
+        from app import app as flask_app
+        threading.Thread(
+            target=lambda: flask_app.run(host=host, port=port, debug=False,
+                                         use_reloader=False, threaded=True),
+            daemon=True,
+        ).start()
     _wait_until_up(url)
 
     try:
@@ -780,7 +882,18 @@ def cmd_start(args):
             return
         import webview
         title = getattr(Config, "STORE_NAME", None) or os.path.basename(ROOT)
-        webview.create_window(title, url, width=1280, height=820, min_size=(1000, 680))
+        window = webview.create_window(title, url, width=1280, height=820,
+                                       min_size=(1000, 680))
+        if args.reload:
+            def _refresh():
+                _wait_until_up(url, timeout=8)   # let the server finish reloading
+                try:
+                    window.load_url(url)
+                    print("↻ reloaded (change detected)")
+                except Exception:
+                    pass
+            threading.Thread(target=_watch_app_files, args=(ROOT, _refresh),
+                             daemon=True).start()
         icon = None
         try:
             from config import resource_path
@@ -802,8 +915,9 @@ def cmd_start(args):
         warn(f"Native window unavailable ({e}).")
         _serve_block(url)
     finally:
-        # The server runs in a daemon thread, so returning here exits the process
-        # and closes the socket — nothing else to stop.
+        if server_proc:                      # stop the reload subprocess + its child
+            try: terminate_pid(server_proc.pid)
+            except Exception: pass
         print("\nStopped.")
         if PID_FILE and os.path.isfile(PID_FILE):
             try: os.remove(PID_FILE)
@@ -1078,7 +1192,8 @@ def cmd_refresh(args):
         ok("Dependencies up to date.")
     if not args.no_migrate:
         try:
-            args.no_assets = True  # refresh does its own touch_static below
+            args.no_assets = True          # refresh does its own touch_static below
+            args.skip_running_check = True  # refresh manages the server lifecycle
             cmd_migrate(args)
         except SystemExit:
             warn("Skipped migrate (database not reachable).")
@@ -1150,10 +1265,26 @@ def build_parser():
         needs_venv=False) \
         .add_argument("--build", action="store_true", help="Also install build deps.")
     add("initdb", cmd_initdb, "Create database, tables, and default admin.", aliases=("init-db",))
-    add("migrate", cmd_migrate, "Apply schema upgrades and refresh static assets.") \
-        .add_argument("--no-assets", action="store_true",
-                      help="Skip refreshing static assets (DB schema only).")
+    sp = add("migrate", cmd_migrate,
+             "Apply schema upgrades + refresh assets (app must be running).")
+    sp.add_argument("app_name", nargs="?", help="App to migrate (default: the zone's app).")
+    sp.add_argument("--no-assets", action="store_true",
+                    help="Skip refreshing static assets (DB schema only).")
     add("seed", cmd_seed, "Insert sample products.")
+
+    sp = add("set-db-password", cmd_set_db_password,
+             "Set the MariaDB connection password in the app's .env.",
+             aliases=("set-db-pass",), needs_venv=False)
+    sp.add_argument("password", nargs="?", help="DB password (prompted if omitted).")
+    sp.add_argument("--user", help="Also set DB_USER (e.g. root).")
+
+    sp = add("set-admin-password", cmd_set_admin_password,
+             "Set an app login user's password (default user 'admin').",
+             aliases=("reset-admin",))
+    sp.add_argument("password", nargs="?", help="New password (prompted if omitted).")
+    sp.add_argument("--user", default="admin", help="Login username (default: admin).")
+    sp.add_argument("--require-change", action="store_true",
+                    help="Force a password change at next login.")
 
     sp = add("start", cmd_start,
              "Run an app: live logs + native window.  e.g. zone start zt-pos")
@@ -1162,6 +1293,8 @@ def build_parser():
     sp.add_argument("--host", help="Host (default from config).")
     sp.add_argument("--no-window", action="store_true",
                     help="Don't open the desktop window; just serve with live logs.")
+    sp.add_argument("--reload", action="store_true",
+                    help="Auto-reload on code edits and refresh the window (local dev).")
     sp.add_argument("--no-version-check", action="store_true",
                     help="Skip the zone CLI update check on startup.")
 
