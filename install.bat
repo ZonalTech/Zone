@@ -33,7 +33,7 @@ echo.
 echo Create your first zone and run an app:
 echo     zonal init mystore
 echo     cd mystore
-echo     zonal get https://github.com/^<org^>/zt-pos.git
+echo     zonal get https://github.com/ZonalTech/Zonal.git
 echo     cd apps\zt-pos
 echo     zonal setup --seed
 echo     zonal start

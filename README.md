@@ -3,17 +3,17 @@
 ## Install
 
 ```bat
-py -m pip install "git+https://github.com/<org>/zonal.git"
+py -m pip install "git+https://github.com/ZonalTech/Zonal.git"
 zonal --version
 ```
 
 ## New machine, start to finish
 
 ```bat
-py -m pip install "git+https://github.com/<org>/zonal.git"
+py -m pip install "git+https://github.com/ZonalTech/Zonal.git"
 zonal init mystore
 cd mystore
-zonal get https://github.com/<org>/zt-pos.git
+zonal get https://github.com/ZonalTech/Zonal.git
 cd apps/zt-pos
 zonal setup --seed
 zonal start
@@ -29,7 +29,7 @@ cd mystore
 ## Get an app
 
 ```bat
-zonal get https://github.com/<org>/zt-pos.git
+zonal get https://github.com/ZonalTech/Zonal.git
 zonal get <repo-url> pos
 zonal get <repo-url> --branch dev
 ```
@@ -87,6 +87,6 @@ zonal build app|setup|all
 ## Update or uninstall zonal
 
 ```bat
-py -m pip install --user --upgrade path\to\zonal
+py -m pip install --user --upgrade "git+https://github.com/ZonalTech/Zonal.git"
 py -m pip uninstall zonal
 ```
