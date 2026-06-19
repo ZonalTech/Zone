@@ -1,0 +1,921 @@
+"""zonal — a lightweight, "bench"-style development framework for ZT POS.
+
+`zonal` is a small CLI you install **once** on your machine. You then use it to
+create and drive any number of independent ZT POS "zones" (one cloned project
+each, like a bench), from setup through serving, migrating, building and
+releasing — instead of remembering a dozen separate scripts and .bat files.
+
+Typical flow (Windows):
+    zonal get https://github.com/<org>/zt-pos.git   :: clone a new zone
+    cd zt-pos
+    zonal setup --seed                               :: make .venv, deps, DB, samples
+    zonal start                                      :: dev server + live logs + browser
+
+How it locates a zone:
+    Every command (except `get`/`version`/`help`) operates on the zone that
+    contains the current directory — zonal walks up from the CWD looking for a
+    ZT POS project (an `app.py` + `config.py` pair), exactly like `bench` finds
+    its bench root. Commands that run POS code re-exec themselves inside that
+    zone's `.venv`, so each zone stays isolated.
+
+Run `zonal help` (or `zonal <command> -h`) for the full command list.
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+# Status lines use ✓/✗ — force UTF-8 so they don't crash a legacy cp1252 console.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+ZONAL_VERSION = "0.2.0"
+
+# These are bound to the active zone in main() via _set_project(). They are
+# None until a zone has been located, so commands that don't need one
+# (`get`, `version`, `help`) can run from anywhere.
+ROOT = None
+STATE_DIR = None
+PID_FILE = None
+
+
+# --------------------------------------------------------------------------- #
+# Zone (project) discovery + per-zone virtualenv
+# --------------------------------------------------------------------------- #
+def is_zone(path):
+    """A directory is a ZT POS zone if it holds both app.py and config.py."""
+    return (os.path.isfile(os.path.join(path, "app.py"))
+            and os.path.isfile(os.path.join(path, "config.py")))
+
+
+def find_zone(start=None):
+    """Walk up from `start` (default: CWD) to the first enclosing zone, or None."""
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        if is_zone(d):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _set_project(root):
+    """Bind module-level paths to the located zone."""
+    global ROOT, STATE_DIR, PID_FILE
+    ROOT = root
+    STATE_DIR = os.path.join(root, ".zonal")
+    PID_FILE = os.path.join(STATE_DIR, "serve.pid")
+
+
+def venv_dir(project):
+    return os.path.join(project, ".venv")
+
+
+def venv_python(project):
+    """Path to the zone venv's Python interpreter (created by `zonal setup`)."""
+    if os.name == "nt":
+        return os.path.join(project, ".venv", "Scripts", "python.exe")
+    return os.path.join(project, ".venv", "bin", "python")
+
+
+def has_venv(project):
+    return bool(project) and os.path.isfile(venv_python(project))
+
+
+def in_project_venv(project):
+    """True if we're already running under this zone's venv interpreter."""
+    try:
+        return (os.path.normcase(os.path.abspath(sys.executable))
+                == os.path.normcase(os.path.abspath(venv_python(project))))
+    except Exception:
+        return False
+
+
+def reexec_in_venv(project, argv):
+    """Re-run `zonal <argv>` using the zone's own venv Python and return its rc.
+
+    POS code (app, config, models, …) lives in the zone's venv, not in
+    whatever interpreter launched zonal, so any command that imports it bounces
+    through here first. ZONAL_IN_VENV stops the child from bouncing again.
+    """
+    py = venv_python(project)
+    if not os.path.isfile(py):
+        die("This zone has no virtual environment yet — run `zonal setup` first.")
+    env = dict(os.environ, ZONAL_IN_VENV="1")
+    return subprocess.call([py, os.path.abspath(__file__), *argv], cwd=project, env=env)
+
+
+# --------------------------------------------------------------------------- #
+# Small output helpers
+# --------------------------------------------------------------------------- #
+def ok(msg):    print(f"✓ {msg}")
+def warn(msg):  print(f"! {msg}")
+def fail(msg):  sys.stdout.flush(); print(f"✗ {msg}", file=sys.stderr)
+def head(msg):  print(f"\n\033[1m{msg}\033[0m" if sys.stdout.isatty() else f"\n{msg}")
+
+
+def die(msg, code=1):
+    fail(msg)
+    raise SystemExit(code)
+
+
+def confirm(prompt):
+    """Ask a yes/no question. Honoured only on a TTY; otherwise require --yes."""
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def run_bat(name, *args):
+    """Run a project .bat (Windows-only build/release helpers)."""
+    path = os.path.join(ROOT, name)
+    if not os.path.isfile(path):
+        die(f"{name} not found in {ROOT}")
+    if os.name != "nt":
+        die(f"{name} is a Windows batch file; run this command on Windows.")
+    return subprocess.call(["cmd", "/c", path, *args], cwd=ROOT)
+
+
+def _write_pidfile(pid, argv):
+    """Record the running dev server so `zonal restart`/`refresh` can find it."""
+    import json
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PID_FILE, "w", encoding="utf-8") as fh:
+        json.dump({"pid": pid, "argv": argv}, fh)
+
+
+def _read_pidfile():
+    import json
+    try:
+        with open(PID_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid):
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                             capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def terminate_pid(pid):
+    """Kill a process (and its children) cross-platform."""
+    if os.name == "nt":
+        return subprocess.call(["taskkill", "/PID", str(pid), "/F", "/T"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    import signal
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def _relaunch_serve(argv):
+    """Start `zonal serve/start …` again, detached, in its own console/session.
+
+    Called from inside the zone's venv (restart/refresh both run there), so
+    sys.executable is already the venv Python; ZONAL_IN_VENV keeps it that way.
+    """
+    cmd = [sys.executable, os.path.abspath(__file__)] + argv
+    env = dict(os.environ, ZONAL_IN_VENV="1")
+    if os.name == "nt":
+        CREATE_NEW_CONSOLE = 0x00000010
+        subprocess.Popen(cmd, cwd=ROOT, creationflags=CREATE_NEW_CONSOLE, env=env)
+    else:
+        subprocess.Popen(cmd, cwd=ROOT, start_new_session=True, env=env)
+
+
+def _stop_running_server():
+    """Stop the dev server recorded in the pidfile. Returns its serve argv or None."""
+    info = _read_pidfile()
+    if not info:
+        return None
+    pid, argv = info.get("pid"), info.get("argv", ["serve"])
+    if pid and _pid_alive(pid):
+        terminate_pid(pid)
+        ok(f"Stopped dev server (pid {pid}).")
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+    return argv
+
+
+def touch_static():
+    """Bump the mtime of CSS/JS so the browser/WebView revalidates cached assets."""
+    import glob
+    n = 0
+    for pat in ("static/css/*.css", "static/js/*.js"):
+        for f in glob.glob(os.path.join(ROOT, pat)):
+            os.utime(f, None)
+            n += 1
+    ok(f"Refreshed {n} static asset(s) (cache-bust).")
+
+
+def find_mariadb_tool(*names):
+    """Locate a MariaDB client binary (mysqldump/mysql or the mariadb-* names).
+
+    Searches PATH first, then the usual `C:\\Program Files\\MariaDB *\\bin`.
+    """
+    for n in names:
+        found = shutil.which(n)
+        if found:
+            return found
+    if os.name == "nt":
+        import glob
+        for base in (r"C:\Program Files\MariaDB *\bin", r"C:\Program Files (x86)\MariaDB *\bin"):
+            for d in sorted(glob.glob(base), reverse=True):
+                for n in names:
+                    cand = os.path.join(d, n if n.endswith(".exe") else n + ".exe")
+                    if os.path.isfile(cand):
+                        return cand
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def cmd_version(args):
+    zone = ROOT or find_zone()
+    ver = "unknown"
+    if zone:
+        vf = os.path.join(zone, "VERSION")
+        if os.path.isfile(vf):
+            ver = open(vf, encoding="utf-8").read().strip()
+    print(f"zonal CLI   v{ZONAL_VERSION}")
+    print(f"Python      {sys.version.split()[0]}")
+    if zone:
+        print(f"ZT POS      v{ver}   ({zone})")
+    else:
+        print("ZT POS      (not in a zone — cd into one or run `zonal get`)")
+
+
+def cmd_get(args):
+    """Clone a ZT POS repository into a new zone (git clone wrapper)."""
+    git = shutil.which("git")
+    if not git:
+        die("git was not found on PATH. Install Git for Windows and retry.")
+    repo = args.repo
+    dest = args.dir or os.path.splitext(os.path.basename(repo.rstrip("/")))[0]
+    if os.path.exists(dest) and os.listdir(dest):
+        die(f"'{dest}' already exists and is not empty.")
+    cmd = [git, "clone"]
+    if args.branch:
+        cmd += ["--branch", args.branch]
+    cmd += [repo, dest]
+    head(f"Cloning {repo} → {dest}/")
+    if subprocess.call(cmd) != 0:
+        die("git clone failed.")
+    if not is_zone(dest):
+        warn(f"Cloned, but '{dest}' doesn't look like a ZT POS project "
+             f"(no app.py/config.py). Double-check the repository.")
+    ok(f"Zone ready at {dest}/")
+    print(f"\nNext:\n  cd {dest}\n  zonal setup --seed   "
+          f":: create .venv, install deps, init the database, add samples"
+          f"\n  zonal start          :: run the dev server (live logs + browser)")
+
+
+def _base_python():
+    """The interpreter used to *build* a zone's venv (zonal's own Python)."""
+    return sys.executable
+
+
+def _ensure_venv(create=False):
+    """Return the zone venv's Python, creating the venv first if asked."""
+    py = venv_python(ROOT)
+    if os.path.isfile(py):
+        ok(".venv present.")
+        return py
+    if not create:
+        return None
+    head("Creating virtual environment (.venv)")
+    rc = subprocess.call([_base_python(), "-m", "venv", venv_dir(ROOT)], cwd=ROOT)
+    if rc != 0 or not os.path.isfile(py):
+        die("Could not create .venv (is the base Python's venv module available?).")
+    subprocess.call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
+    ok("Created .venv")
+    return py
+
+
+def _pip_install_venv(pip_args, quiet=False):
+    """pip install … into the zone's venv."""
+    py = venv_python(ROOT)
+    cmd = [py, "-m", "pip", "install"] + (["-q"] if quiet else []) + list(pip_args)
+    return subprocess.call(cmd, cwd=ROOT)
+
+
+def cmd_install(args):
+    """Install the zone's Python dependencies into its .venv."""
+    _ensure_venv(create=True)
+    head("Installing runtime dependencies")
+    rc = _pip_install_venv(["-r", "requirements.txt"])
+    if rc == 0:
+        ok("Runtime dependencies installed.")
+    if args.build:
+        head("Installing build dependencies")
+        rc2 = _pip_install_venv(["-r", "build-requirements.txt"])
+        if rc2 == 0:
+            ok("Build dependencies installed.")
+        rc = rc or rc2
+    raise SystemExit(rc)
+
+
+def cmd_ensure_env(args=None):
+    """Create .env from .env.example if it doesn't exist yet."""
+    env_path = os.path.join(ROOT, ".env")
+    example = os.path.join(ROOT, ".env.example")
+    if os.path.isfile(env_path):
+        ok(".env already present.")
+        return
+    if os.path.isfile(example):
+        shutil.copyfile(example, env_path)
+        ok("Created .env from .env.example — edit it if your MariaDB password differs.")
+    else:
+        warn("No .env or .env.example found; using built-in defaults (root / pos_db).")
+
+
+def cmd_initdb(args):
+    """Create the database, all tables, and the default admin (idempotent)."""
+    import init_db
+    head("Initializing database")
+    try:
+        init_db.create_database()
+        init_db.create_tables()
+        if init_db.ensure_default_admin():
+            ok(f"Created default admin '{init_db.DEFAULT_ADMIN['username']}' "
+               f"(password '{init_db.DEFAULT_ADMIN['password']}') — change it after first login!")
+    except Exception as e:
+        die(f"Could not initialize the database.\n  {type(e).__name__}: {e}\n"
+            f"  Is MariaDB running, and do DB_USER/DB_PASSWORD in .env match?")
+    ok("Database ready.")
+
+
+def cmd_migrate(args):
+    """Apply idempotent schema upgrades to an existing database."""
+    import migrate
+    head("Migrating database")
+    try:
+        migrate.create_new_tables()
+        migrate.upgrade_sales_table()
+        migrate.upgrade_users_table()
+        migrate.upgrade_products_table()
+        import init_db
+        if init_db.ensure_default_admin():
+            ok("Created default admin (password 'admin') — change it after first login!")
+    except Exception as e:
+        die(f"Migration failed.\n  {type(e).__name__}: {e}")
+    ok("Migration complete.")
+
+
+def cmd_seed(args):
+    """Insert sample products so the POS is usable immediately."""
+    import seed
+    head("Seeding sample data")
+    seed.run()
+
+
+def cmd_setup(args):
+    """First-time zone setup: .env → .venv + deps → create DB → (optionally) seed.
+
+    Runs under zonal's own interpreter (it has to *build* the zone venv first),
+    then bounces the database steps into that fresh venv where the POS code and
+    its dependencies live.
+    """
+    head("ZT POS — first-time zone setup")
+    cmd_ensure_env()
+    if not args.skip_install:
+        _ensure_venv(create=True)
+        head("Installing runtime dependencies")
+        if _pip_install_venv(["-r", "requirements.txt"], quiet=True) != 0:
+            die("Dependency install failed.")
+        ok("Dependencies installed.")
+    elif not has_venv(ROOT):
+        warn("--skip-install given but this zone has no .venv yet; "
+             "database steps need one. Run `zonal install` first.")
+        return
+    # initdb (+ seed) need the POS code, so run them inside the zone's venv.
+    if reexec_in_venv(ROOT, ["initdb"]) != 0:
+        die("Database initialization failed.")
+    if args.seed and reexec_in_venv(ROOT, ["seed"]) != 0:
+        die("Seeding failed.")
+    print("\nSetup done. Start the app with:  zonal start   "
+          "(or  zonal launch  for the desktop window)")
+
+
+def _open_browser_later(url, delay=1.5):
+    """Open the browser shortly after the server starts (non-blocking)."""
+    import threading, webbrowser
+    t = threading.Timer(delay, lambda: webbrowser.open(url))
+    t.daemon = True
+    t.start()
+    ok(f"Opening {url} …")
+
+
+def _serve(host, port, reload_, prod, serve_argv, open_browser):
+    """Shared dev-server runner for `serve` and `start` (runs in the foreground).
+
+    With the reloader on, Werkzeug spawns a child that does the real serving;
+    only that child should write the pidfile and open the browser, so we skip
+    the parent watchdog (WERKZEUG_RUN_MAIN != "true").
+    """
+    reloader_parent = reload_ and not prod and os.environ.get("WERKZEUG_RUN_MAIN") != "true"
+    from app import app
+    if not reloader_parent:
+        _write_pidfile(os.getpid(), serve_argv)
+        if open_browser:
+            bh = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+            _open_browser_later(f"http://{bh}:{port}")
+    try:
+        if prod:
+            head(f"Serving (waitress, production WSGI) on http://{host}:{port}")
+            from waitress import serve
+            serve(app, host=host, port=port, threads=8)
+        else:
+            head(f"Serving (Flask dev server) on http://{host}:{port}  reload={reload_}")
+            app.run(host=host, port=port, debug=reload_, use_reloader=reload_)
+    finally:
+        if PID_FILE and os.path.isfile(PID_FILE):
+            try: os.remove(PID_FILE)
+            except OSError: pass
+
+
+def cmd_serve(args):
+    """Run the Flask dev server in the browser (auto-reload only with --reload)."""
+    from config import Config
+    host, port = args.host or Config.HOST, args.port or Config.PORT
+    os.environ.setdefault("FLASK_DEBUG", "1" if args.reload else "0")
+    serve_argv = ["serve"]
+    if args.port: serve_argv += ["--port", str(args.port)]
+    if args.host: serve_argv += ["--host", args.host]
+    if args.reload: serve_argv.append("--reload")
+    if args.prod: serve_argv.append("--prod")
+    _serve(host, port, args.reload, args.prod, serve_argv, open_browser=False)
+
+
+def cmd_start(args):
+    """Start the dev server the bench way: live logs, auto-reload, opens the app.
+
+    This is the everyday `zonal start` — it stays in the foreground streaming
+    the server log, reloads on code changes, and opens the POS in your browser.
+    Ctrl+C stops it.
+    """
+    reload_ = (not args.no_reload) and (not args.prod)
+    from config import Config
+    host, port = args.host or Config.HOST, args.port or Config.PORT
+    os.environ.setdefault("FLASK_DEBUG", "1" if reload_ else "0")
+    serve_argv = ["start"]
+    if args.port: serve_argv += ["--port", str(args.port)]
+    if args.host: serve_argv += ["--host", args.host]
+    if args.no_reload: serve_argv.append("--no-reload")
+    if args.no_browser: serve_argv.append("--no-browser")
+    if args.prod: serve_argv.append("--prod")
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        head("Starting ZT POS — live logs below, press Ctrl+C to stop")
+    _serve(host, port, reload_, args.prod, serve_argv, open_browser=not args.no_browser)
+
+
+def cmd_restart(args):
+    """Stop and relaunch the dev server recorded by `zonal start`/`serve`."""
+    head("Restarting dev server")
+    argv = _stop_running_server()
+    if argv is None:
+        warn("No running dev server found (start one with `zonal start`).")
+        return
+    _relaunch_serve(argv)
+    ok(f"Relaunched: zonal {' '.join(argv)} (in a new window).")
+
+
+def cmd_launch(args):
+    """Run the full desktop app (native window via launcher.py)."""
+    import launcher
+    head("Launching ZT POS desktop app")
+    launcher.serve()
+
+
+def cmd_shell(args):
+    """Open a Python REPL inside the app context (db + models preloaded)."""
+    import code
+    from app import app
+    from models import db
+    import models
+    ctx = app.app_context()
+    ctx.push()
+    banner = ("ZT POS shell — `app`, `db`, and `models` are available; an app "
+              "context is active.\nType exit() to quit.")
+    ns = {"app": app, "db": db, "models": models}
+    try:
+        code.interact(banner=banner, local=ns)
+    finally:
+        ctx.pop()
+
+
+def cmd_db(args):
+    """Open the MariaDB client connected to the POS database."""
+    from config import Config
+    client = find_mariadb_tool("mysql", "mariadb")
+    if not client:
+        die("Could not find the mysql/mariadb client. Add MariaDB's bin/ to PATH.")
+    cmd = [client, "-h", Config.DB_HOST, "-P", str(Config.DB_PORT),
+           "-u", Config.DB_USER, Config.DB_NAME]
+    env = dict(os.environ)
+    if Config.DB_PASSWORD:
+        env["MYSQL_PWD"] = Config.DB_PASSWORD  # avoids password on the command line
+    raise SystemExit(subprocess.call(cmd, env=env))
+
+
+def cmd_backup(args):
+    """Dump the POS database to backups/ as a timestamped .sql file."""
+    import datetime
+    from config import Config
+    dump = find_mariadb_tool("mysqldump", "mariadb-dump")
+    if not dump:
+        die("Could not find mysqldump/mariadb-dump. Add MariaDB's bin/ to PATH.")
+    backups = os.path.join(ROOT, "backups")
+    os.makedirs(backups, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = args.output or os.path.join(backups, f"{Config.DB_NAME}-{stamp}.sql")
+    cmd = [dump, "-h", Config.DB_HOST, "-P", str(Config.DB_PORT),
+           "-u", Config.DB_USER, "--single-transaction", "--routines",
+           "--databases", Config.DB_NAME]
+    env = dict(os.environ)
+    if Config.DB_PASSWORD:
+        env["MYSQL_PWD"] = Config.DB_PASSWORD
+    head(f"Backing up '{Config.DB_NAME}'")
+    with open(out, "w", encoding="utf-8") as fh:
+        rc = subprocess.call(cmd, stdout=fh, env=env)
+    if rc != 0:
+        die("Backup failed (see messages above).")
+    ok(f"Saved {out} ({os.path.getsize(out) // 1024} KB)")
+
+
+def cmd_restore(args):
+    """Restore the database from a .sql dump (DESTRUCTIVE — overwrites data)."""
+    from config import Config
+    if not os.path.isfile(args.file):
+        die(f"Dump not found: {args.file}")
+    client = find_mariadb_tool("mysql", "mariadb")
+    if not client:
+        die("Could not find the mysql/mariadb client. Add MariaDB's bin/ to PATH.")
+    if not args.yes and not confirm(
+            f"Restore '{args.file}' into '{Config.DB_NAME}', overwriting current data?"):
+        die("Aborted.", code=0)
+    cmd = [client, "-h", Config.DB_HOST, "-P", str(Config.DB_PORT), "-u", Config.DB_USER]
+    env = dict(os.environ)
+    if Config.DB_PASSWORD:
+        env["MYSQL_PWD"] = Config.DB_PASSWORD
+    head(f"Restoring into '{Config.DB_NAME}'")
+    with open(args.file, "r", encoding="utf-8") as fh:
+        rc = subprocess.call(cmd, stdin=fh, env=env)
+    if rc != 0:
+        die("Restore failed.")
+    ok("Restore complete.")
+
+
+def cmd_reset_db(args):
+    """Drop and recreate the database from scratch (DESTRUCTIVE)."""
+    import sqlalchemy
+    from sqlalchemy import text
+    from config import Config, server_uri
+    if not args.yes and not confirm(
+            f"Drop and recreate '{Config.DB_NAME}'? ALL DATA WILL BE LOST."):
+        die("Aborted.", code=0)
+    head(f"Resetting '{Config.DB_NAME}'")
+    engine = sqlalchemy.create_engine(server_uri())
+    with engine.connect() as conn:
+        conn.execute(text(f"DROP DATABASE IF EXISTS `{Config.DB_NAME}`"))
+        conn.commit()
+    engine.dispose()
+    ok("Dropped.")
+    cmd_initdb(args)
+    if args.seed:
+        cmd_seed(args)
+
+
+def cmd_doctor(args):
+    """Check that the zone is ready to run the app."""
+    # Package checks must run inside the zone's venv to be meaningful, so bounce
+    # there when it exists and we aren't already in it.
+    if (has_venv(ROOT) and not os.environ.get("ZONAL_IN_VENV")
+            and not in_project_venv(ROOT)):
+        raise SystemExit(reexec_in_venv(ROOT, ["doctor"]))
+
+    head("Environment check")
+    problems = 0
+
+    py_ok = sys.version_info[:2] >= (3, 9)
+    (ok if py_ok else fail)(f"Python {sys.version.split()[0]} "
+                            f"({'>= 3.9' if py_ok else 'upgrade to 3.9+'})")
+    problems += 0 if py_ok else 1
+
+    if has_venv(ROOT):
+        ok("Zone .venv present.")
+    else:
+        fail("No .venv for this zone (run `zonal setup`).")
+        problems += 1
+
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    (ok if in_venv else warn)("Virtual environment active." if in_venv
+                              else "Not in a virtualenv (recommended: .venv).")
+
+    env_ok = os.path.isfile(os.path.join(ROOT, ".env"))
+    (ok if env_ok else warn)(".env present." if env_ok else "No .env (run `zonal setup`).")
+
+    for mod in ("flask", "sqlalchemy", "pymysql", "dotenv", "waitress"):
+        try:
+            __import__(mod)
+            ok(f"package: {mod}")
+        except ImportError:
+            fail(f"package missing: {mod} (run `zonal install`)")
+            problems += 1
+
+    try:
+        from provision import can_connect
+        from config import Config, server_uri
+        if can_connect(server_uri(), timeout=4):
+            ok(f"MariaDB server reachable at {Config.DB_HOST}:{Config.DB_PORT}")
+        else:
+            fail(f"MariaDB server not reachable at {Config.DB_HOST}:{Config.DB_PORT} "
+                 f"(is the service running? are credentials right?)")
+            problems += 1
+        if can_connect(Config.SQLALCHEMY_DATABASE_URI, timeout=4):
+            ok(f"Database '{Config.DB_NAME}' reachable.")
+        else:
+            warn(f"Database '{Config.DB_NAME}' not found (run `zonal initdb`).")
+    except Exception as e:
+        fail(f"DB check error: {type(e).__name__}: {e}")
+        problems += 1
+
+    tool = find_mariadb_tool("mysqldump", "mariadb-dump")
+    (ok if tool else warn)(f"mysqldump found ({tool})." if tool
+                           else "mysqldump not on PATH (backup/restore unavailable).")
+
+    print()
+    if problems:
+        die(f"{problems} problem(s) found.")
+    ok("All good — the app is ready to run.")
+
+
+def cmd_config(args):
+    """Print the effective configuration (password masked)."""
+    from config import Config
+    head("Effective configuration")
+    rows = [
+        ("STORE_NAME", Config.STORE_NAME),
+        ("CURRENCY", Config.CURRENCY),
+        ("DB_HOST", Config.DB_HOST),
+        ("DB_PORT", Config.DB_PORT),
+        ("DB_NAME", Config.DB_NAME),
+        ("DB_USER", Config.DB_USER),
+        ("DB_PASSWORD", "•••" if Config.DB_PASSWORD else "(empty)"),
+        ("POS host:port", f"{Config.HOST}:{Config.PORT}"),
+    ]
+    for k, v in rows:
+        print(f"  {k:<16} {v}")
+
+
+def cmd_routes(args):
+    """List all registered URL routes."""
+    from app import app
+    head("Routes")
+    rules = sorted(app.url_map.iter_rules(), key=lambda r: str(r))
+    for r in rules:
+        methods = ",".join(sorted(m for m in r.methods if m not in ("HEAD", "OPTIONS")))
+        print(f"  {str(r):<34} {methods:<18} {r.endpoint}")
+
+
+def cmd_bump(args):
+    """Bump the app version and roll the changelog."""
+    sys.argv = ["bump_version.py", args.part]
+    import bump_version
+    bump_version.main()
+
+
+def _build_app_payload():
+    """Compile POS.exe and repackage release/ZTPOS-<ver>.zip + manifest.json."""
+    head("Building app payload (POS.exe + release zip + manifest)")
+    if run_bat("build-setup.bat") != 0:
+        die("build-setup.bat failed.")
+    ok("App payload built into release/.")
+
+
+def _build_setup_file():
+    """Rebuild the online installer setup/ZTPOS-Online-Setup.exe."""
+    head("Building setup file (online installer)")
+    if run_bat("build-online-setup.bat") != 0:
+        die("build-online-setup.bat failed.")
+    ok("Setup file built: setup/ZTPOS-Online-Setup.exe")
+
+
+def cmd_build(args):
+    """Build the app payload, the setup file, or both."""
+    if args.target in ("app", "all"):
+        _build_app_payload()
+    if args.target in ("setup", "all"):
+        _build_setup_file()
+    ok("Build complete.")
+
+
+def cmd_update(args):
+    """Bump the version, rebuild the app payload, and rebuild the setup file.
+
+    This is the 'build and update the app locally + refresh the setup file'
+    one-shot: it bumps the version (so the new local build carries a new number),
+    repackages the release zip/manifest, and rebuilds the installer.
+    """
+    if not args.no_bump:
+        head(f"Bumping version ({args.part})")
+        sys.argv = ["bump_version.py", args.part]
+        import bump_version
+        bump_version.main()
+    _build_app_payload()
+    if not args.no_setup:
+        _build_setup_file()
+    ver = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
+    print(f"\nLocal update ready — v{ver}. Artifacts in release/ and setup/.")
+
+
+def cmd_refresh(args):
+    """Fast local-dev refresh (no PyInstaller): deps, migrate, static, restart."""
+    head("Refreshing local development environment")
+    if not args.no_deps:
+        subprocess.call([sys.executable, "-m", "pip", "install", "-q", "-r",
+                         os.path.join(ROOT, "requirements.txt")], cwd=ROOT)
+        ok("Dependencies up to date.")
+    if not args.no_migrate:
+        try:
+            cmd_migrate(args)
+        except SystemExit:
+            warn("Skipped migrate (database not reachable).")
+    touch_static()
+    if not args.no_restart:
+        argv = _stop_running_server()
+        if argv is None:
+            warn("No running dev server to restart (start one with `zonal start`).")
+        else:
+            _relaunch_serve(argv)
+            ok(f"Relaunched: zonal {' '.join(argv)} (in a new window).")
+    print("\nRefresh done.")
+
+
+def cmd_release(args):
+    """Cut a GitHub release (delegates to release-github.bat)."""
+    head("Releasing via release-github.bat")
+    raise SystemExit(run_bat("release-github.bat"))
+
+
+# --------------------------------------------------------------------------- #
+# Argument parser
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="zonal",
+        description="Local development framework for ZT POS (a lightweight 'bench').",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-V", "--version", action="store_true", help="Show versions and exit.")
+    sub = p.add_subparsers(dest="command", metavar="<command>")
+
+    def add(name, fn, help, aliases=(), needs_project=True, needs_venv=True):
+        sp = sub.add_parser(name, help=help, aliases=aliases, description=fn.__doc__)
+        # needs_project: must be run inside a zone.  needs_venv: must run under
+        # the zone's .venv (main() re-execs there before calling fn).
+        sp.set_defaults(func=fn, needs_project=needs_project, needs_venv=needs_venv)
+        return sp
+
+    add("version", cmd_version, "Show zonal / Python / zone versions.",
+        needs_project=False, needs_venv=False)
+
+    sp = add("get", cmd_get, "Clone a ZT POS repo into a new zone.",
+             aliases=("clone",), needs_project=False, needs_venv=False)
+    sp.add_argument("repo", help="Git URL of the ZT POS repository.")
+    sp.add_argument("dir", nargs="?", help="Target folder (default: repo name).")
+    sp.add_argument("--branch", help="Clone a specific branch/tag.")
+
+    # setup/install manage the zone's venv themselves, so they don't need to be
+    # *inside* it (needs_venv=False).
+    add("setup", cmd_setup, "First-time setup: .env, .venv + deps, database, optional seed.",
+        needs_venv=False) \
+        .add_argument("--seed", action="store_true", help="Also insert sample products.")
+    sub.choices["setup"].add_argument("--skip-install", action="store_true",
+                                      help="Skip the .venv/dependency step.")
+    add("install", cmd_install, "Create the zone .venv and install dependencies.",
+        needs_venv=False) \
+        .add_argument("--build", action="store_true", help="Also install build deps.")
+    add("initdb", cmd_initdb, "Create database, tables, and default admin.", aliases=("init-db",))
+    add("migrate", cmd_migrate, "Apply idempotent schema upgrades.")
+    add("seed", cmd_seed, "Insert sample products.")
+
+    sp = add("start", cmd_start, "Start the dev server: live logs, reload, opens the app.")
+    sp.add_argument("--port", type=int, help="Port (default from config).")
+    sp.add_argument("--host", help="Host (default from config).")
+    sp.add_argument("--no-reload", action="store_true", help="Disable auto-reload.")
+    sp.add_argument("--no-browser", action="store_true", help="Don't open the browser.")
+    sp.add_argument("--prod", action="store_true", help="Use the waitress WSGI server.")
+
+    sp = add("serve", cmd_serve, "Run the Flask dev server (browser, no auto-open).")
+    sp.add_argument("--port", type=int, help="Port (default from config).")
+    sp.add_argument("--host", help="Host (default from config).")
+    sp.add_argument("--reload", action="store_true", help="Auto-reload on code changes.")
+    sp.add_argument("--prod", action="store_true", help="Use the waitress WSGI server.")
+
+    add("launch", cmd_launch, "Run the desktop app (native window).")
+    add("restart", cmd_restart, "Stop and relaunch the dev server.")
+
+    sp = add("refresh", cmd_refresh, "Fast local-dev refresh: deps, migrate, static, restart.")
+    sp.add_argument("--no-deps", action="store_true", help="Skip pip install.")
+    sp.add_argument("--no-migrate", action="store_true", help="Skip DB migration.")
+    sp.add_argument("--no-restart", action="store_true", help="Don't restart the dev server.")
+
+    add("shell", cmd_shell, "Python REPL with app context (db, models).", aliases=("console",))
+    add("db", cmd_db, "Open the MariaDB client on the POS database.", aliases=("mariadb",))
+
+    sp = add("backup", cmd_backup, "Dump the database to backups/.")
+    sp.add_argument("-o", "--output", help="Write to this file instead of backups/.")
+
+    sp = add("restore", cmd_restore, "Restore the database from a .sql dump (destructive).")
+    sp.add_argument("file", help="Path to the .sql dump.")
+    sp.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+
+    sp = add("reset-db", cmd_reset_db, "Drop and recreate the database (destructive).")
+    sp.add_argument("--seed", action="store_true", help="Also re-seed sample products.")
+    sp.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
+
+    add("doctor", cmd_doctor, "Check the zone is ready.", needs_venv=False)
+    add("config", cmd_config, "Print effective configuration (password masked).")
+    add("routes", cmd_routes, "List registered URL routes.")
+
+    add("bump", cmd_bump, "Bump version + changelog.", needs_venv=False) \
+        .add_argument("part", nargs="?", default="patch",
+                      help="major | minor | patch | X.Y.Z (default: patch).")
+
+    sp = add("build", cmd_build, "Build the app payload, the setup file, or both.",
+             needs_venv=False)
+    sp.add_argument("target", nargs="?", choices=("app", "setup", "all"), default="app",
+                    help="app = POS.exe + release zip (default); setup = installer; all = both.")
+
+    sp = add("update", cmd_update, "Bump version + rebuild app payload + rebuild setup file.",
+             needs_venv=False)
+    sp.add_argument("part", nargs="?", default="patch",
+                    help="major | minor | patch | X.Y.Z (default: patch).")
+    sp.add_argument("--no-bump", action="store_true", help="Don't bump the version.")
+    sp.add_argument("--no-setup", action="store_true", help="Skip rebuilding the setup file.")
+
+    add("release", cmd_release, "Cut a GitHub release.", needs_venv=False)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    raw = sys.argv[1:] if argv is None else list(argv)
+    # `zonal help` / `zonal help <cmd>` → friendly usage (argparse uses -h/--help).
+    if raw and raw[0] == "help":
+        if len(raw) > 1 and raw[1] in parser._subparsers._group_actions[0].choices:
+            parser._subparsers._group_actions[0].choices[raw[1]].print_help()
+        else:
+            parser.print_help()
+        return
+    args = parser.parse_args(argv)
+    if args.version:
+        return cmd_version(args)
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return
+
+    # Locate the zone (unless this command runs from anywhere, e.g. `get`).
+    if getattr(args, "needs_project", True):
+        zone = find_zone()
+        if not zone:
+            die("Not inside a ZT POS zone.\n"
+                "  cd into a cloned project, or create one with:  zonal get <repo-url>")
+        _set_project(zone)
+        os.chdir(zone)
+        if zone not in sys.path:
+            sys.path.insert(0, zone)
+
+        # Commands that import POS code must run under the zone's own .venv.
+        if (getattr(args, "needs_venv", True)
+                and not os.environ.get("ZONAL_IN_VENV")
+                and not in_project_venv(zone)):
+            if not has_venv(zone):
+                die("This zone has no virtual environment yet — run `zonal setup` first.")
+            raise SystemExit(reexec_in_venv(zone, raw))
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
