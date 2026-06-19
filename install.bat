@@ -22,9 +22,11 @@ if errorlevel 1 (
         echo Install failed. Make sure you are NOT inside a virtualenv and retry.
         endlocal & exit /b 1
     )
-    echo If 'zone' is not found, add this folder to PATH:
-    for /f "delims=" %%B in ('%PY% -m site --user-base') do echo     %%B\Scripts
 )
+
+REM Self-register zone.exe's folder on PATH (the CLI does this on first run).
+echo Registering 'zone' on your PATH ...
+%PY% -m zone --version
 
 echo.
 echo Done. Open a NEW terminal, then from ANY folder run:
