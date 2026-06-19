@@ -33,30 +33,38 @@ try:
 except Exception:
     pass
 
-ZONAL_VERSION = "0.2.0"
+ZONAL_VERSION = "0.3.0"
 
-# These are bound to the active zone in main() via _set_project(). They are
-# None until a zone has been located, so commands that don't need one
-# (`get`, `version`, `help`) can run from anywhere.
-ROOT = None
-STATE_DIR = None
-PID_FILE = None
+# A zone is a workspace (created by `zonal init`) holding a shared .venv and an
+# apps/ folder; apps are cloned into apps/<name> by `zonal get`. The globals
+# below are bound in main(): ZONE = the zone root, ROOT = the active app dir.
+ZONE = None         # zone root (holds .venv, .zonal/, apps/)
+ROOT = None         # active app directory  (apps/<name>) — what commands act on
+STATE_DIR = None    # <zone>/.zonal
+PID_FILE = None     # <zone>/.zonal/serve-<app>.pid
+
+ZONE_MARKER = os.path.join(".zonal", "zone.json")
 
 
 # --------------------------------------------------------------------------- #
-# Zone (project) discovery + per-zone virtualenv
+# Zone & app discovery + the zone's shared virtualenv
 # --------------------------------------------------------------------------- #
-def is_zone(path):
-    """A directory is a ZT POS zone if it holds both app.py and config.py."""
+def is_app(path):
+    """A directory is an app if it holds both app.py and config.py."""
     return (os.path.isfile(os.path.join(path, "app.py"))
             and os.path.isfile(os.path.join(path, "config.py")))
 
 
+def is_zone_root(path):
+    """A directory is a zone root if it carries the .zonal/zone.json marker."""
+    return os.path.isfile(os.path.join(path, ZONE_MARKER))
+
+
 def find_zone(start=None):
-    """Walk up from `start` (default: CWD) to the first enclosing zone, or None."""
+    """Walk up from `start` (default: CWD) to the enclosing zone root, or None."""
     d = os.path.abspath(start or os.getcwd())
     while True:
-        if is_zone(d):
+        if is_zone_root(d):
             return d
         parent = os.path.dirname(d)
         if parent == d:
@@ -64,50 +72,91 @@ def find_zone(start=None):
         d = parent
 
 
-def _set_project(root):
-    """Bind module-level paths to the located zone."""
-    global ROOT, STATE_DIR, PID_FILE
-    ROOT = root
-    STATE_DIR = os.path.join(root, ".zonal")
-    PID_FILE = os.path.join(STATE_DIR, "serve.pid")
+def apps_dir(zone):
+    return os.path.join(zone, "apps")
 
 
-def venv_dir(project):
-    return os.path.join(project, ".venv")
+def zone_apps(zone):
+    """Names of the apps installed in a zone (dirs under apps/ that look like apps)."""
+    ad = apps_dir(zone)
+    if not os.path.isdir(ad):
+        return []
+    return sorted(n for n in os.listdir(ad) if is_app(os.path.join(ad, n)))
 
 
-def venv_python(project):
-    """Path to the zone venv's Python interpreter (created by `zonal setup`)."""
+def resolve_app(zone, explicit=None, start=None):
+    """Pick which app a command targets: --app, else the CWD's app, else the only one."""
+    ad = apps_dir(zone)
+    if explicit:
+        p = os.path.join(ad, explicit)
+        if is_app(p):
+            return p
+        die(f"No app named '{explicit}' in this zone. Installed: "
+            f"{', '.join(zone_apps(zone)) or '(none)'}")
+    cwd = os.path.abspath(start or os.getcwd())
+    for name in zone_apps(zone):
+        ap = os.path.join(ad, name)
+        if cwd == ap or cwd.startswith(ap + os.sep):
+            return ap
+    apps = zone_apps(zone)
+    if len(apps) == 1:
+        return os.path.join(ad, apps[0])
+    if not apps:
+        die("This zone has no apps yet — add one with:  zonal get <repo-url>")
+    die("This zone has several apps — choose one with --app:\n  "
+        + ", ".join(apps) + "\n  e.g.  zonal --app " + apps[0] + " start")
+
+
+def _set_zone(zone):
+    global ZONE, STATE_DIR
+    ZONE = zone
+    STATE_DIR = os.path.join(zone, ".zonal")
+
+
+def _set_app(app_dir):
+    """Bind the active app and its per-app server pidfile (kept under the zone)."""
+    global ROOT, PID_FILE
+    ROOT = app_dir
+    PID_FILE = os.path.join(STATE_DIR, f"serve-{os.path.basename(app_dir)}.pid")
+
+
+def venv_dir(zone):
+    return os.path.join(zone, ".venv")
+
+
+def venv_python(zone):
+    """Path to the zone's shared venv interpreter (created by `zonal init`)."""
     if os.name == "nt":
-        return os.path.join(project, ".venv", "Scripts", "python.exe")
-    return os.path.join(project, ".venv", "bin", "python")
+        return os.path.join(zone, ".venv", "Scripts", "python.exe")
+    return os.path.join(zone, ".venv", "bin", "python")
 
 
-def has_venv(project):
-    return bool(project) and os.path.isfile(venv_python(project))
+def has_venv(zone):
+    return bool(zone) and os.path.isfile(venv_python(zone))
 
 
-def in_project_venv(project):
-    """True if we're already running under this zone's venv interpreter."""
+def in_zone_venv(zone):
+    """True if we're already running under the zone's venv interpreter."""
     try:
         return (os.path.normcase(os.path.abspath(sys.executable))
-                == os.path.normcase(os.path.abspath(venv_python(project))))
+                == os.path.normcase(os.path.abspath(venv_python(zone))))
     except Exception:
         return False
 
 
-def reexec_in_venv(project, argv):
-    """Re-run `zonal <argv>` using the zone's own venv Python and return its rc.
+def reexec_in_venv(zone, app_dir, argv):
+    """Re-run `zonal <argv>` under the zone's venv, anchored in the app dir.
 
-    POS code (app, config, models, …) lives in the zone's venv, not in
-    whatever interpreter launched zonal, so any command that imports it bounces
-    through here first. ZONAL_IN_VENV stops the child from bouncing again.
+    App code (app, config, models, …) is installed in the zone's shared venv,
+    not in whatever interpreter launched zonal, so any command that imports it
+    bounces through here first. cwd=app_dir means the child re-resolves the same
+    app from its location; ZONAL_IN_VENV stops it from bouncing again.
     """
-    py = venv_python(project)
+    py = venv_python(zone)
     if not os.path.isfile(py):
-        die("This zone has no virtual environment yet — run `zonal setup` first.")
+        die("This zone has no virtual environment yet — run `zonal init` (or `zonal setup`).")
     env = dict(os.environ, ZONAL_IN_VENV="1")
-    return subprocess.call([py, os.path.abspath(__file__), *argv], cwd=project, env=env)
+    return subprocess.call([py, os.path.abspath(__file__), *argv], cwd=app_dir, env=env)
 
 
 # --------------------------------------------------------------------------- #
@@ -250,43 +299,21 @@ def find_mariadb_tool(*names):
 # Commands
 # --------------------------------------------------------------------------- #
 def cmd_version(args):
-    zone = ROOT or find_zone()
-    ver = "unknown"
-    if zone:
-        vf = os.path.join(zone, "VERSION")
-        if os.path.isfile(vf):
-            ver = open(vf, encoding="utf-8").read().strip()
     print(f"zonal CLI   v{ZONAL_VERSION}")
     print(f"Python      {sys.version.split()[0]}")
-    if zone:
-        print(f"ZT POS      v{ver}   ({zone})")
-    else:
-        print("ZT POS      (not in a zone — cd into one or run `zonal get`)")
-
-
-def cmd_get(args):
-    """Clone a ZT POS repository into a new zone (git clone wrapper)."""
-    git = shutil.which("git")
-    if not git:
-        die("git was not found on PATH. Install Git for Windows and retry.")
-    repo = args.repo
-    dest = args.dir or os.path.splitext(os.path.basename(repo.rstrip("/")))[0]
-    if os.path.exists(dest) and os.listdir(dest):
-        die(f"'{dest}' already exists and is not empty.")
-    cmd = [git, "clone"]
-    if args.branch:
-        cmd += ["--branch", args.branch]
-    cmd += [repo, dest]
-    head(f"Cloning {repo} → {dest}/")
-    if subprocess.call(cmd) != 0:
-        die("git clone failed.")
-    if not is_zone(dest):
-        warn(f"Cloned, but '{dest}' doesn't look like a ZT POS project "
-             f"(no app.py/config.py). Double-check the repository.")
-    ok(f"Zone ready at {dest}/")
-    print(f"\nNext:\n  cd {dest}\n  zonal setup --seed   "
-          f":: create .venv, install deps, init the database, add samples"
-          f"\n  zonal start          :: run the dev server (live logs + browser)")
+    zone = find_zone()
+    if not zone:
+        print("zone        (none here — create one with `zonal init <name>`)")
+        return
+    print(f"zone        {zone}")
+    apps = zone_apps(zone)
+    if not apps:
+        print("apps        (none yet — add one with `zonal get <repo-url>`)")
+        return
+    for name in apps:
+        vf = os.path.join(apps_dir(zone), name, "VERSION")
+        ver = open(vf, encoding="utf-8").read().strip() if os.path.isfile(vf) else "?"
+        print(f"app         {name}  v{ver}")
 
 
 def _base_python():
@@ -294,33 +321,96 @@ def _base_python():
     return sys.executable
 
 
-def _ensure_venv(create=False):
-    """Return the zone venv's Python, creating the venv first if asked."""
-    py = venv_python(ROOT)
+def cmd_init(args):
+    """Create a new zone: a workspace with its own shared .venv and apps/ folder."""
+    zone = os.path.abspath(args.name or ".")
+    name = os.path.basename(zone) or zone
+    os.makedirs(zone, exist_ok=True)
+    if os.listdir(zone) and not is_zone_root(zone):
+        warn(f"'{zone}' is not empty; initializing a zone in it anyway.")
+    head(f"Initializing zone '{name}'")
+    os.makedirs(apps_dir(zone), exist_ok=True)
+    os.makedirs(os.path.join(zone, ".zonal"), exist_ok=True)
+    if not is_zone_root(zone):
+        import json
+        with open(os.path.join(zone, ZONE_MARKER), "w", encoding="utf-8") as fh:
+            json.dump({"zone": name, "zonal": ZONAL_VERSION}, fh, indent=2)
+    # Build the zone's shared virtualenv (apps install their deps into it).
+    py = venv_python(zone)
     if os.path.isfile(py):
-        ok(".venv present.")
+        ok(".venv already present.")
+    else:
+        head("Creating the zone virtual environment (.venv)")
+        if subprocess.call([_base_python(), "-m", "venv", venv_dir(zone)]) != 0 \
+                or not os.path.isfile(py):
+            die("Could not create .venv (is the base Python's venv module available?).")
+        subprocess.call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
+        ok("Created .venv")
+    ok(f"Zone ready at {zone}")
+    cd = "" if zone == os.path.abspath(os.getcwd()) else f"  cd {args.name}\n"
+    print(f"\nNext:\n{cd}  zonal get <repo-url>   :: clone an app (e.g. ZT POS) into the zone")
+
+
+def cmd_get(args):
+    """Clone an app repository from GitHub into this zone's apps/ folder."""
+    git = shutil.which("git")
+    if not git:
+        die("git was not found on PATH. Install Git for Windows and retry.")
+    repo = args.repo
+    name = args.name or os.path.splitext(os.path.basename(repo.rstrip("/")))[0]
+    dest = os.path.join(apps_dir(ZONE), name)
+    if os.path.exists(dest) and os.listdir(dest):
+        die(f"App '{name}' already exists in this zone (apps/{name}).")
+    os.makedirs(apps_dir(ZONE), exist_ok=True)
+    cmd = [git, "clone"]
+    if args.branch:
+        cmd += ["--branch", args.branch]
+    cmd += [repo, dest]
+    head(f"Cloning {repo} → apps/{name}/")
+    if subprocess.call(cmd) != 0:
+        die("git clone failed.")
+    if not is_app(dest):
+        warn(f"Cloned, but apps/{name} doesn't look like an app (no app.py/config.py).")
+    # Install the app's dependencies into the zone's shared venv.
+    req = os.path.join(dest, "requirements.txt")
+    if has_venv(ZONE) and os.path.isfile(req):
+        head(f"Installing {name}'s dependencies into the zone .venv")
+        if _pip_install_venv(["-r", "requirements.txt"], cwd=dest, quiet=True) != 0:
+            warn("Dependency install hit an error — re-run `zonal setup` after checking it.")
+        else:
+            ok("Dependencies installed.")
+    elif not has_venv(ZONE):
+        warn("Zone has no .venv (was it created with `zonal init`?). Run `zonal setup` next.")
+    ok(f"App '{name}' added to the zone.")
+    print(f"\nNext:\n  cd apps/{name}\n  zonal setup --seed   "
+          f":: .env, install deps, init the database, add samples"
+          f"\n  zonal start          :: run the dev server (live logs + browser)")
+
+
+def _pip_install_venv(pip_args, cwd=None, quiet=False):
+    """pip install … into the zone's shared venv (defaults cwd to the active app)."""
+    py = venv_python(ZONE)
+    cmd = [py, "-m", "pip", "install"] + (["-q"] if quiet else []) + list(pip_args)
+    return subprocess.call(cmd, cwd=cwd or ROOT)
+
+
+def _ensure_zone_venv():
+    """Make sure the zone venv exists (it normally does, from `zonal init`)."""
+    py = venv_python(ZONE)
+    if os.path.isfile(py):
         return py
-    if not create:
-        return None
-    head("Creating virtual environment (.venv)")
-    rc = subprocess.call([_base_python(), "-m", "venv", venv_dir(ROOT)], cwd=ROOT)
-    if rc != 0 or not os.path.isfile(py):
+    head("Creating the zone virtual environment (.venv)")
+    if subprocess.call([_base_python(), "-m", "venv", venv_dir(ZONE)]) != 0 \
+            or not os.path.isfile(py):
         die("Could not create .venv (is the base Python's venv module available?).")
     subprocess.call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
     ok("Created .venv")
     return py
 
 
-def _pip_install_venv(pip_args, quiet=False):
-    """pip install … into the zone's venv."""
-    py = venv_python(ROOT)
-    cmd = [py, "-m", "pip", "install"] + (["-q"] if quiet else []) + list(pip_args)
-    return subprocess.call(cmd, cwd=ROOT)
-
-
 def cmd_install(args):
-    """Install the zone's Python dependencies into its .venv."""
-    _ensure_venv(create=True)
+    """Install the active app's dependencies into the zone's shared .venv."""
+    _ensure_zone_venv()
     head("Installing runtime dependencies")
     rc = _pip_install_venv(["-r", "requirements.txt"])
     if rc == 0:
@@ -389,28 +479,28 @@ def cmd_seed(args):
 
 
 def cmd_setup(args):
-    """First-time zone setup: .env → .venv + deps → create DB → (optionally) seed.
+    """First-time app setup: .env → deps into the zone .venv → DB → (optionally) seed.
 
-    Runs under zonal's own interpreter (it has to *build* the zone venv first),
-    then bounces the database steps into that fresh venv where the POS code and
-    its dependencies live.
+    Runs under zonal's own interpreter (so it can install into the zone venv),
+    then bounces the database steps into that venv where the app code and its
+    dependencies live.
     """
-    head("ZT POS — first-time zone setup")
+    head(f"Setting up app '{os.path.basename(ROOT)}'")
     cmd_ensure_env()
     if not args.skip_install:
-        _ensure_venv(create=True)
+        _ensure_zone_venv()
         head("Installing runtime dependencies")
         if _pip_install_venv(["-r", "requirements.txt"], quiet=True) != 0:
             die("Dependency install failed.")
         ok("Dependencies installed.")
-    elif not has_venv(ROOT):
+    elif not has_venv(ZONE):
         warn("--skip-install given but this zone has no .venv yet; "
              "database steps need one. Run `zonal install` first.")
         return
-    # initdb (+ seed) need the POS code, so run them inside the zone's venv.
-    if reexec_in_venv(ROOT, ["initdb"]) != 0:
+    # initdb (+ seed) need the app code, so run them inside the zone's venv.
+    if reexec_in_venv(ZONE, ROOT, ["initdb"]) != 0:
         die("Database initialization failed.")
-    if args.seed and reexec_in_venv(ROOT, ["seed"]) != 0:
+    if args.seed and reexec_in_venv(ZONE, ROOT, ["seed"]) != 0:
         die("Seeding failed.")
     print("\nSetup done. Start the app with:  zonal start   "
           "(or  zonal launch  for the desktop window)")
@@ -609,11 +699,11 @@ def cmd_doctor(args):
     """Check that the zone is ready to run the app."""
     # Package checks must run inside the zone's venv to be meaningful, so bounce
     # there when it exists and we aren't already in it.
-    if (has_venv(ROOT) and not os.environ.get("ZONAL_IN_VENV")
-            and not in_project_venv(ROOT)):
-        raise SystemExit(reexec_in_venv(ROOT, ["doctor"]))
+    if (has_venv(ZONE) and not os.environ.get("ZONAL_IN_VENV")
+            and not in_zone_venv(ZONE)):
+        raise SystemExit(reexec_in_venv(ZONE, ROOT, ["doctor"]))
 
-    head("Environment check")
+    head(f"Environment check — app '{os.path.basename(ROOT)}'")
     problems = 0
 
     py_ok = sys.version_info[:2] >= (3, 9)
@@ -621,10 +711,10 @@ def cmd_doctor(args):
                             f"({'>= 3.9' if py_ok else 'upgrade to 3.9+'})")
     problems += 0 if py_ok else 1
 
-    if has_venv(ROOT):
+    if has_venv(ZONE):
         ok("Zone .venv present.")
     else:
-        fail("No .venv for this zone (run `zonal setup`).")
+        fail("No .venv for this zone (run `zonal init` / `zonal setup`).")
         problems += 1
 
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
@@ -787,32 +877,39 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("-V", "--version", action="store_true", help="Show versions and exit.")
+    p.add_argument("-a", "--app", metavar="NAME",
+                   help="Which app in the zone to act on (when it has more than one).")
     sub = p.add_subparsers(dest="command", metavar="<command>")
 
-    def add(name, fn, help, aliases=(), needs_project=True, needs_venv=True):
+    def add(name, fn, help, aliases=(), needs_zone=True, needs_app=True, needs_venv=True):
         sp = sub.add_parser(name, help=help, aliases=aliases, description=fn.__doc__)
-        # needs_project: must be run inside a zone.  needs_venv: must run under
-        # the zone's .venv (main() re-execs there before calling fn).
-        sp.set_defaults(func=fn, needs_project=needs_project, needs_venv=needs_venv)
+        # needs_zone: must be inside a zone.  needs_app: also resolves an active
+        # app (chdir into it).  needs_venv: re-exec under the zone .venv first.
+        sp.set_defaults(func=fn, needs_zone=needs_zone, needs_app=needs_app,
+                        needs_venv=needs_venv)
         return sp
 
     add("version", cmd_version, "Show zonal / Python / zone versions.",
-        needs_project=False, needs_venv=False)
+        needs_zone=False, needs_app=False, needs_venv=False)
 
-    sp = add("get", cmd_get, "Clone a ZT POS repo into a new zone.",
-             aliases=("clone",), needs_project=False, needs_venv=False)
-    sp.add_argument("repo", help="Git URL of the ZT POS repository.")
-    sp.add_argument("dir", nargs="?", help="Target folder (default: repo name).")
+    sp = add("init", cmd_init, "Create a new zone (workspace + shared .venv + apps/).",
+             needs_zone=False, needs_app=False, needs_venv=False)
+    sp.add_argument("name", nargs="?", help="Zone folder to create (default: current dir).")
+
+    sp = add("get", cmd_get, "Clone an app from GitHub into this zone's apps/.",
+             aliases=("clone",), needs_app=False, needs_venv=False)
+    sp.add_argument("repo", help="Git URL of the app repository.")
+    sp.add_argument("name", nargs="?", help="App folder name under apps/ (default: repo name).")
     sp.add_argument("--branch", help="Clone a specific branch/tag.")
 
-    # setup/install manage the zone's venv themselves, so they don't need to be
-    # *inside* it (needs_venv=False).
-    add("setup", cmd_setup, "First-time setup: .env, .venv + deps, database, optional seed.",
+    # setup/install install into the zone venv themselves, so they don't need to
+    # be re-exec'd *inside* it (needs_venv=False).
+    add("setup", cmd_setup, "Set up the app: .env, deps, database, optional seed.",
         needs_venv=False) \
         .add_argument("--seed", action="store_true", help="Also insert sample products.")
     sub.choices["setup"].add_argument("--skip-install", action="store_true",
-                                      help="Skip the .venv/dependency step.")
-    add("install", cmd_install, "Create the zone .venv and install dependencies.",
+                                      help="Skip the dependency step.")
+    add("install", cmd_install, "Install the app's dependencies into the zone .venv.",
         needs_venv=False) \
         .add_argument("--build", action="store_true", help="Also install build deps.")
     add("initdb", cmd_initdb, "Create database, tables, and default admin.", aliases=("init-db",))
@@ -854,7 +951,7 @@ def build_parser():
     sp.add_argument("--seed", action="store_true", help="Also re-seed sample products.")
     sp.add_argument("--yes", action="store_true", help="Skip the confirmation prompt.")
 
-    add("doctor", cmd_doctor, "Check the zone is ready.", needs_venv=False)
+    add("doctor", cmd_doctor, "Check the app/zone is ready.", needs_venv=False)
     add("config", cmd_config, "Print effective configuration (password masked).")
     add("routes", cmd_routes, "List registered URL routes.")
 
@@ -895,24 +992,32 @@ def main(argv=None):
         parser.print_help()
         return
 
-    # Locate the zone (unless this command runs from anywhere, e.g. `get`).
-    if getattr(args, "needs_project", True):
+    # Locate the zone (every command except init/get-from-anywhere/version).
+    if getattr(args, "needs_zone", True):
         zone = find_zone()
         if not zone:
-            die("Not inside a ZT POS zone.\n"
-                "  cd into a cloned project, or create one with:  zonal get <repo-url>")
-        _set_project(zone)
-        os.chdir(zone)
-        if zone not in sys.path:
-            sys.path.insert(0, zone)
+            die("Not inside a zone.\n"
+                "  Create one with:  zonal init <name>\n"
+                "  then add an app:  zonal get <repo-url>")
+        _set_zone(zone)
 
-        # Commands that import POS code must run under the zone's own .venv.
-        if (getattr(args, "needs_venv", True)
-                and not os.environ.get("ZONAL_IN_VENV")
-                and not in_project_venv(zone)):
-            if not has_venv(zone):
-                die("This zone has no virtual environment yet — run `zonal setup` first.")
-            raise SystemExit(reexec_in_venv(zone, raw))
+        if getattr(args, "needs_app", True):
+            # Pick the app this command targets, move into it, import from it.
+            app_dir = resolve_app(zone, explicit=getattr(args, "app", None))
+            _set_app(app_dir)
+            os.chdir(app_dir)
+            if app_dir not in sys.path:
+                sys.path.insert(0, app_dir)
+
+            # Commands that import app code run under the zone's shared .venv.
+            if (getattr(args, "needs_venv", True)
+                    and not os.environ.get("ZONAL_IN_VENV")
+                    and not in_zone_venv(zone)):
+                if not has_venv(zone):
+                    die("This zone has no virtual environment yet — run `zonal setup` first.")
+                raise SystemExit(reexec_in_venv(zone, app_dir, raw))
+        else:
+            os.chdir(zone)  # zone-only commands (e.g. `get`) operate at the root
 
     args.func(args)
 

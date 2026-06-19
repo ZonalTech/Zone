@@ -1,36 +1,40 @@
 @echo off
 REM ===== Install the zonal CLI globally on this machine (Windows) =====
-REM Installs once; afterwards `zonal` works from any directory, and you manage
-REM as many ZT POS zones as you like with `zonal get` / `zonal setup` / `zonal start`.
+REM Installs once into your real Python so `zonal` works from ANY directory,
+REM exactly like `bench`. No path switching afterwards.
 setlocal
 set "HERE=%~dp0"
 
-REM zonal must land in the REAL Python, never a project's .venv. Drop any active
-REM virtualenv for this script and use the `py` launcher so VIRTUAL_ENV / a
-REM venv-first PATH can't hijack the install. zonal has no dependencies of its
-REM own, so a plain "pip install --user" is all it needs.
+REM Editors like VS Code auto-activate a project's .venv in the terminal, which
+REM hijacks pip. Drop any active virtualenv and use the `py` launcher so we
+REM install into the real, global Python. zonal has no dependencies of its own.
 set "VIRTUAL_ENV="
 where py >nul 2>nul && (set "PY=py") || (set "PY=python")
 
-echo Installing the zonal CLI with %PY% ...
-%PY% -m pip install --user "%HERE%."
+echo Installing the zonal CLI globally with %PY% ...
+%PY% -m pip install "%HERE%."
 if errorlevel 1 (
     echo.
-    echo Install failed. Make sure you're NOT inside a virtualenv ^(run "deactivate"
-    echo or open a new terminal^), then re-run install.bat.
-    endlocal & exit /b 1
+    echo Global install failed ^(permissions?^) - falling back to a per-user install...
+    %PY% -m pip install --user "%HERE%."
+    if errorlevel 1 (
+        echo.
+        echo Install failed. Make sure you are NOT inside a virtualenv and retry.
+        endlocal & exit /b 1
+    )
+    echo If 'zonal' is not found, add this folder to PATH:
+    for /f "delims=" %%B in ('%PY% -m site --user-base') do echo     %%B\Scripts
 )
 
 echo.
-echo If 'zonal' is not found, add your user Scripts folder to PATH:
-for /f "delims=" %%B in ('%PY% -m site --user-base') do echo     %%B\Scripts
-echo.
-echo Open a NEW terminal so PATH refreshes, then verify with:
+echo Done. Open a NEW terminal, then from ANY folder run:
 echo     zonal --version
 echo.
-echo Then create your first zone:
+echo Create your first zone and run an app:
+echo     zonal init mystore
+echo     cd mystore
 echo     zonal get https://github.com/^<org^>/zt-pos.git
-echo     cd zt-pos
+echo     cd apps\zt-pos
 echo     zonal setup --seed
 echo     zonal start
 endlocal
