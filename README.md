@@ -18,11 +18,13 @@ zone setup --seed
 zone start
 ```
 
-## Create a zone
+## Create a zone (also scaffolds a starter app)
 
 ```bat
-zone init mystore
+zone init mystore        # creates mystore/.venv + apps/mystore (starter app)
 cd mystore
+zone start mystore       # runs the starter app immediately
+zone init mystore --no-app   # ...or skip the starter app
 ```
 
 ## Get an app
@@ -43,7 +45,8 @@ zone start zt-pos
 ## Commands
 
 ```
-zone init [NAME]
+zone init [NAME] [--app-name N] [--no-app]   # also scaffolds a starter app in apps/
+zone new NAME                      # scaffold another minimal app in apps/
 zone get REPO [NAME] [--branch B]
 zone setup [APP] [--seed] [--skip-install]
 zone install [--build]

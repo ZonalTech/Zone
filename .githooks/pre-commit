@@ -1,0 +1,20 @@
+#!/bin/sh
+# Bump the patch version on EVERY commit, so each commit is its own version.
+# Enable once per clone with:  git config core.hooksPath .githooks
+#
+# The bump edits pyproject.toml + zone.py and re-stages them, so the version
+# change is part of the commit being created (no extra commit, no CI loop).
+
+# Don't bump during merges/rebases (avoids noise on combined commits).
+gitdir="$(git rev-parse --git-dir)"
+[ -f "$gitdir/MERGE_HEAD" ] && exit 0
+
+PY="$(command -v python || command -v py || command -v python3)"
+if [ -z "$PY" ]; then
+  echo "pre-commit: python not found on PATH; skipping version bump" >&2
+  exit 0
+fi
+
+top="$(git rev-parse --show-toplevel)"
+"$PY" "$top/.githooks/bump_patch.py" || exit 1
+git add "$top/pyproject.toml" "$top/zone.py"

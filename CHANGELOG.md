@@ -4,6 +4,5 @@
 
 Initial release of the **zone** CLI.
 
-Subsequent entries are generated automatically by the weekly version bump
-(`.github/workflows/weekly-version-bump.yml`), which combines each week's
-commits into a single patch release.
+The patch version is bumped automatically on **every commit** by the
+`.githooks/pre-commit` hook (enable with `git config core.hooksPath .githooks`).

@@ -35,7 +35,7 @@ try:
 except Exception:
     pass
 
-ZONE_VERSION = "1.0.0"
+ZONE_VERSION = "1.0.1"
 # Where the zone CLI itself lives, for version checks and `zone upgrade`.
 ZONE_REPO = os.environ.get("ZONE_REPO", "ZonalTech/Zone")
 
@@ -415,7 +415,7 @@ def cmd_init(args):
     if not is_zone_root(zone):
         import json
         with open(os.path.join(zone, ZONE_MARKER), "w", encoding="utf-8") as fh:
-            json.dump({"zone": name, "zone": ZONE_VERSION}, fh, indent=2)
+            json.dump({"zone": name, "created_with": ZONE_VERSION}, fh, indent=2)
     # Build the zone's shared virtualenv (apps install their deps into it).
     py = venv_python(zone)
     if os.path.isfile(py):
@@ -428,8 +428,31 @@ def cmd_init(args):
         subprocess.call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
         ok("Created .venv")
     ok(f"Zone ready at {zone}")
-    cd = "" if zone == os.path.abspath(os.getcwd()) else f"  cd {args.name}\n"
-    print(f"\nNext:\n{cd}  zone get <repo-url>   :: clone an app (e.g. ZT POS) into the zone")
+
+    # Scaffold a starter app into apps/ (named after the zone) unless opted out,
+    # so the new zone has something to run immediately.
+    app_name = None
+    if not args.no_app:
+        app_name = args.app_name or name
+        dest = os.path.join(apps_dir(zone), app_name)
+        if os.path.exists(dest) and os.listdir(dest):
+            warn(f"apps/{app_name} already exists — leaving it as-is.")
+        else:
+            head(f"Scaffolding starter app at apps/{app_name}")
+            _scaffold_app(dest, app_name)
+            if subprocess.call([py, "-m", "pip", "install", "-q", "-r",
+                                "requirements.txt"], cwd=dest) == 0:
+                ok(f"Starter app ready at apps/{app_name} (deps installed).")
+            else:
+                warn(f"Scaffolded apps/{app_name}, but dependency install hit an error.")
+
+    cd = "" if zone == os.path.abspath(os.getcwd()) else f"  cd {os.path.basename(zone)}\n"
+    if app_name:
+        print(f"\nNext:\n{cd}  zone start {app_name}        :: run the starter app\n"
+              f"  zone get <repo-url>   :: or clone another app into the zone")
+    else:
+        print(f"\nNext:\n{cd}  zone new <name>       :: scaffold an app\n"
+              f"  zone get <repo-url>   :: or clone one into the zone")
 
 
 def cmd_get(args):
@@ -464,6 +487,131 @@ def cmd_get(args):
         warn("Zone has no .venv (was it created with `zone init`?). Run `zone setup` next.")
     ok(f"App added at apps/{name}")
     print(f"  Set up & run it:  zone setup {name} --seed   then   zone start {name}")
+
+
+# --- `zone new` scaffold (a minimal, runnable Flask app) --------------------- #
+# Use the __APP_NAME__ token (not str.format) so f-string braces in the
+# templates are left untouched.
+_SCAFFOLD = {
+    "app.py": '''"""Minimal Flask app scaffolded by `zone new` — edit me."""
+from flask import Flask, render_template
+
+from config import Config
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html", store=Config.STORE_NAME)
+
+
+if __name__ == "__main__":
+    app.run(host=Config.HOST, port=Config.PORT, debug=True)
+''',
+    "config.py": '''"""App configuration — reads from environment / a .env file."""
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
+
+
+class Config:
+    SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
+    STORE_NAME = os.getenv("STORE_NAME", "__APP_NAME__")
+
+    # Local MariaDB connection (only used if you add a database later).
+    DB_USER = os.getenv("DB_USER", "root")
+    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+    DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+    DB_PORT = os.getenv("DB_PORT", "3306")
+    DB_NAME = os.getenv("DB_NAME", "__APP_NAME___db")
+    SQLALCHEMY_DATABASE_URI = (
+        f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+    )
+
+    HOST = os.getenv("POS_HOST", "127.0.0.1")
+    PORT = int(os.getenv("POS_PORT", "5000"))
+
+
+def server_uri():
+    """URI without a database name — for CREATE DATABASE if you add one."""
+    return (f"mysql+pymysql://{Config.DB_USER}:{Config.DB_PASSWORD}"
+            f"@{Config.DB_HOST}:{Config.DB_PORT}/?charset=utf8mb4")
+''',
+    "requirements.txt": "flask\npython-dotenv\npywebview\nwaitress\n",
+    ".env.example": '''# Copy to ".env" and adjust.
+SECRET_KEY=change-me
+STORE_NAME=__APP_NAME__
+POS_HOST=127.0.0.1
+POS_PORT=5000
+
+# Only needed if you add a database:
+DB_USER=root
+DB_PASSWORD=
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_NAME=__APP_NAME___db
+''',
+    "templates/index.html": '''<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ store }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <main>
+    <h1>{{ store }}</h1>
+    <p>Your new <strong>zone</strong> app is running. Edit
+       <code>apps/__APP_NAME__/templates/index.html</code>, then run
+       <code>zone start __APP_NAME__ --reload</code> for live edits.</p>
+  </main>
+</body>
+</html>
+''',
+    "static/style.css": ''':root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; display: grid; place-items: center;
+       min-height: 100vh; margin: 0; }
+main { max-width: 40rem; padding: 2rem; text-align: center; line-height: 1.5; }
+h1 { margin: 0 0 .5rem; }
+code { background: rgba(127, 127, 127, .18); padding: .1em .35em; border-radius: .3em; }
+''',
+}
+
+
+def _scaffold_app(dest, name):
+    """Write the minimal app skeleton into `dest`, substituting the app name."""
+    for rel, content in _SCAFFOLD.items():
+        path = os.path.join(dest, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content.replace("__APP_NAME__", name))
+
+
+def cmd_new(args):
+    """Scaffold a new, minimal zone-compatible Flask app under apps/<name>."""
+    name = args.name
+    dest = os.path.join(apps_dir(ZONE), name)
+    if os.path.exists(dest) and os.listdir(dest):
+        die(f"App '{name}' already exists in this zone (apps/{name}).")
+    head(f"Creating new app at apps/{name}")
+    _scaffold_app(dest, name)
+    ok(f"Scaffolded apps/{name} (app.py, config.py, templates/, static/).")
+    # Install its deps into the zone's shared venv so it runs straight away.
+    if has_venv(ZONE):
+        head("Installing dependencies into the zone .venv")
+        if _pip_install_venv(["-r", "requirements.txt"], cwd=dest, quiet=True) != 0:
+            warn("Dependency install hit an error — run `zone setup` after checking it.")
+        else:
+            ok("Dependencies installed.")
+    else:
+        warn("Zone has no .venv (create the zone with `zone init`). Run `zone setup` next.")
+    print(f"\nNext:\n  zone setup {name}   :: .env + deps\n"
+          f"  zone start {name}   :: run it (live logs + native window)")
 
 
 def _pip_install_venv(pip_args, cwd=None, quiet=False):
@@ -587,6 +735,8 @@ def _prompt_db_password(force=False):
 
 def cmd_initdb(args):
     """Create the database, all tables, and the default admin (idempotent)."""
+    if not os.path.isfile(os.path.join(ROOT, "init_db.py")):
+        die("This app has no init_db.py — it has no database to initialize.")
     # Ensure a password is set first — .env is read at import time below, so this
     # has to run before `import init_db` pulls in config.
     _prompt_db_password()
@@ -711,17 +861,21 @@ def cmd_setup(args):
         warn("--skip-install given but this zone has no .venv yet; "
              "database steps need one. Run `zone install` first.")
         return
-    # Ask for the MariaDB password up front (here, where we're interactive),
-    # save it to .env, and tell the initdb child not to prompt again.
-    _prompt_db_password()
-    os.environ["ZONE_DB_PROMPTED"] = "1"
-    # initdb (+ seed) need the app code, so run them inside the zone's venv.
-    if reexec_in_venv(ZONE, ROOT, ["initdb"]) != 0:
-        die("Database initialization failed.")
-    if args.seed and reexec_in_venv(ZONE, ROOT, ["seed"]) != 0:
-        die("Seeding failed.")
-    print("\nSetup done. Start the app with:  zone start   "
-          "(or  zone launch  for the desktop window)")
+    # Database steps only apply if the app ships an init_db.py (DB-less apps,
+    # e.g. those scaffolded by `zone new`, skip this entirely).
+    if os.path.isfile(os.path.join(ROOT, "init_db.py")):
+        # Ask for the MariaDB password up front (here, where we're interactive),
+        # save it to .env, and tell the initdb child not to prompt again.
+        _prompt_db_password()
+        os.environ["ZONE_DB_PROMPTED"] = "1"
+        if reexec_in_venv(ZONE, ROOT, ["initdb"]) != 0:
+            die("Database initialization failed.")
+        if args.seed and os.path.isfile(os.path.join(ROOT, "seed.py")) \
+                and reexec_in_venv(ZONE, ROOT, ["seed"]) != 0:
+            die("Seeding failed.")
+    else:
+        ok("No init_db.py found — skipping database setup (this app has no database).")
+    print(f"\nSetup done. Start the app with:  zone start {os.path.basename(ROOT)}")
 
 
 def _pick_port(host, preferred):
@@ -1244,15 +1398,22 @@ def build_parser():
         .add_argument("--force", action="store_true",
                       help="Reinstall even if already on the latest version.")
 
-    sp = add("init", cmd_init, "Create a new zone (workspace + shared .venv + apps/).",
+    sp = add("init", cmd_init, "Create a new zone (workspace + .venv + a starter app).",
              needs_zone=False, needs_app=False, needs_venv=False)
     sp.add_argument("name", nargs="?", help="Zone folder to create (default: current dir).")
+    sp.add_argument("--app-name", help="Name for the starter app (default: the zone name).")
+    sp.add_argument("--no-app", action="store_true",
+                    help="Don't scaffold a starter app (empty apps/).")
 
     sp = add("get", cmd_get, "Clone an app from GitHub into this zone's apps/.",
              aliases=("clone",), needs_app=False, needs_venv=False)
     sp.add_argument("repo", help="Git URL of the app repository.")
     sp.add_argument("name", nargs="?", help="App folder name under apps/ (default: repo name).")
     sp.add_argument("--branch", help="Clone a specific branch/tag.")
+
+    sp = add("new", cmd_new, "Scaffold a new minimal app in this zone's apps/.",
+             aliases=("create",), needs_app=False, needs_venv=False)
+    sp.add_argument("name", help="App folder name to create under apps/.")
 
     # setup/install install into the zone venv themselves, so they don't need to
     # be re-exec'd *inside* it (needs_venv=False).
