@@ -48,9 +48,9 @@ zone get REPO [NAME] [--branch B]
 zone setup [APP] [--seed] [--skip-install]
 zone install [--build]
 zone initdb
-zone migrate
+zone migrate [--no-assets]
 zone seed
-zone start [APP] [--port] [--host] [--no-window]
+zone start [APP] [--port] [--host] [--no-window] [--no-version-check]
 zone serve [--port] [--host] [--reload] [--prod]
 zone launch
 zone restart
@@ -68,6 +68,7 @@ zone build [app|setup|all]
 zone update [part] [--no-bump] [--no-setup]
 zone release
 zone version
+zone upgrade [--force]
 zone --app NAME <command>
 zone help [command]
 ```

@@ -1,10 +1,9 @@
 """zone — a small development CLI for ZT POS and apps built on it.
 
-`zone` is a CLI you install **once** on your machine. You then use it to create
-**zones** (workspaces, each with a shared `.venv` and an `apps/` folder), clone
-apps into them, and drive their whole dev lifecycle (set up, serve, migrate,
-seed, back up, build, release) — instead of remembering a dozen separate
-scripts and .bat files.
+Install `zone` once, then use it to create **zones** (workspaces, each with a
+shared `.venv` and an `apps/` folder), clone apps into them, and drive the whole
+dev lifecycle — set up, serve, migrate, seed, back up, build, release — without
+juggling a dozen separate scripts and .bat files.
 
 Typical flow (Windows):
     zone init mystore                               :: create a zone (workspace + .venv)
@@ -14,12 +13,12 @@ Typical flow (Windows):
     zone start zt-pos                               :: dev server: live logs + native window
 
 How it locates a zone and app:
-    Every command (except `init`/`get`/`version`/`help`) operates on the zone
-    that contains the current directory — `zone` walks up from the CWD looking
-    for the `.zone/zone.json` marker. It then targets the named app (`zone start
-    zt-pos`), the app whose folder you're in, or the zone's only app. Commands
-    that run app code re-exec inside the zone's shared `.venv`, so zones stay
-    isolated.
+    Most commands (all but `init`/`get`/`version`/`upgrade`/`help`) act on the
+    zone containing the current directory: `zone` walks up from the CWD to the
+    `.zone/zone.json` marker. Within that zone it targets the named app
+    (`zone start zt-pos`), the app whose folder you're in, or the zone's only
+    app. Commands that run app code re-exec inside the zone's shared `.venv`, so
+    zones stay isolated.
 
 Run `zone help` (or `zone <command> -h`) for the full command list.
 """
@@ -36,7 +35,9 @@ try:
 except Exception:
     pass
 
-ZONE_VERSION = "0.3.0"
+ZONE_VERSION = "1.0.0"
+# Where the zone CLI itself lives, for version checks and `zone upgrade`.
+ZONE_REPO = os.environ.get("ZONE_REPO", "ZonalTech/Zone")
 
 # Bound in main() once the zone and active app are located.
 ZONE = None         # zone root (holds .venv, .zone/, apps/)
@@ -156,7 +157,21 @@ def reexec_in_venv(zone, app_dir, argv):
     if not os.path.isfile(py):
         die("This zone has no virtual environment yet — run `zone init` (or `zone setup`).")
     env = dict(os.environ, ZONE_IN_VENV="1")
-    return subprocess.call([py, os.path.abspath(__file__), *argv], cwd=app_dir, env=env)
+    proc = subprocess.Popen([py, os.path.abspath(__file__), *argv], cwd=app_dir, env=env)
+    try:
+        return proc.wait()
+    except KeyboardInterrupt:
+        # Ctrl+C reaches the child too; let it shut down its server/window, then
+        # exit quietly. Force it down only if it hangs. No traceback.
+        try:
+            proc.wait(timeout=10)
+        except (KeyboardInterrupt, subprocess.TimeoutExpired):
+            terminate_pid(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        return proc.returncode if proc.returncode is not None else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -314,6 +329,72 @@ def cmd_version(args):
         vf = os.path.join(apps_dir(zone), name, "VERSION")
         ver = open(vf, encoding="utf-8").read().strip() if os.path.isfile(vf) else "?"
         print(f"app         {name}  v{ver}")
+
+
+def _version_tuple(v):
+    """Loose version → comparable tuple ('0.4.0' -> (0, 4, 0))."""
+    out = []
+    for part in str(v).split("."):
+        num = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(num) if num else 0)
+    return tuple(out)
+
+
+def _latest_zone_version(timeout=3.0):
+    """Fetch the newest zone CLI version from the repo's pyproject (None if offline)."""
+    import re, urllib.request
+    for branch in ("main", "master"):
+        url = f"https://raw.githubusercontent.com/{ZONE_REPO}/{branch}/pyproject.toml"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                text = r.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+        m = re.search(r'(?m)^\s*version\s*=\s*["\']([^"\']+)["\']', text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _check_zone_update(timeout=3.0):
+    """Show current vs latest zone CLI version. Returns latest (or None if offline)."""
+    latest = _latest_zone_version(timeout=timeout)
+    if not latest:
+        return None
+    if _version_tuple(latest) > _version_tuple(ZONE_VERSION):
+        warn(f"zone CLI update available: {ZONE_VERSION} -> {latest}   (run `zone upgrade`)")
+    else:
+        ok(f"zone CLI v{ZONE_VERSION} (up to date)")
+    return latest
+
+
+def cmd_upgrade(args):
+    """Upgrade the zone CLI itself to the latest from its Git repo."""
+    head(f"Upgrading the zone CLI (current v{ZONE_VERSION})")
+    latest = _latest_zone_version()
+    if latest:
+        print(f"  {ZONE_VERSION} -> {latest}")
+        if _version_tuple(latest) <= _version_tuple(ZONE_VERSION) and not args.force:
+            ok("Already up to date. (use --force to reinstall anyway)")
+            return
+    else:
+        warn("Couldn't reach the repo to check the latest version; upgrading anyway.")
+    src = os.path.dirname(os.path.abspath(__file__))
+    git = shutil.which("git")
+    if git and os.path.isdir(os.path.join(src, ".git")):
+        # Source/editable install: pull the latest commits in place.
+        head(f"git pull in {src}")
+        if subprocess.call([git, "-C", src, "pull", "--ff-only"]) != 0:
+            die("git pull failed (uncommitted changes or diverged history?). "
+                "Resolve it in the CLI source and retry.")
+    else:
+        # Installed from a Git URL: reinstall the newest from the repo.
+        url = f"git+https://github.com/{ZONE_REPO}.git"
+        head(f"pip install --upgrade {url}")
+        if subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", url]) != 0:
+            die("pip upgrade failed.")
+    ok("Upgrade complete. Run `zone --version` to confirm "
+       "(reopen the terminal if the version looks unchanged).")
 
 
 def _base_python():
@@ -533,7 +614,7 @@ def cmd_initdb(args):
 
 
 def cmd_migrate(args):
-    """Apply idempotent schema upgrades to an existing database."""
+    """Apply idempotent schema upgrades and refresh static assets to the latest."""
     import migrate
     head("Migrating database")
     try:
@@ -547,6 +628,10 @@ def cmd_migrate(args):
     except Exception as e:
         die(f"Migration failed.\n  {type(e).__name__}: {e}")
     ok("Migration complete.")
+    # Rebuild/refresh assets so the app serves the latest CSS/JS (cache-bust).
+    if not getattr(args, "no_assets", False):
+        head("Refreshing assets")
+        touch_static()
 
 
 def cmd_seed(args):
@@ -613,7 +698,7 @@ def _wait_until_up(url, timeout=15.0):
 
 
 def _serve_block(url):
-    """Keep the background server alive without a window — and WITHOUT a browser."""
+    """Keep the background server alive with neither a window nor a browser."""
     import time
     print(f"\nServer still running at {url} — open it manually if you like. Ctrl+C to stop.")
     try:
@@ -652,7 +737,7 @@ def cmd_serve(args):
 
 
 def cmd_start(args):
-    """Start the dev server with LIVE LOGS and render the app in a native desktop window.
+    """Start the dev server with live logs and render the app in a native desktop window.
 
     No browser: the UI opens in an embedded WebView2 window (via pywebview),
     just like the packaged app, while the dev server's request log streams to
@@ -660,6 +745,9 @@ def cmd_start(args):
     own the main thread; close the window (or press Ctrl+C) to stop.
     """
     import threading
+    # Track the zone CLI version: show current -> latest and nudge to upgrade.
+    if not args.no_version_check:
+        _check_zone_update()
     from app import app as flask_app
     from config import Config
     host = args.host or Config.HOST
@@ -686,10 +774,10 @@ def cmd_start(args):
     ).start()
     _wait_until_up(url)
 
-    if args.no_window:
-        _serve_block(url)
-        return
     try:
+        if args.no_window:
+            _serve_block(url)
+            return
         import webview
         title = getattr(Config, "STORE_NAME", None) or os.path.basename(ROOT)
         webview.create_window(title, url, width=1280, height=820, min_size=(1000, 680))
@@ -704,6 +792,8 @@ def cmd_start(args):
             webview.start(icon=icon) if icon else webview.start()
         except TypeError:
             webview.start()  # older pywebview without the icon argument
+    except KeyboardInterrupt:
+        pass  # Ctrl+C: fall through to a clean shutdown
     except ImportError:
         warn("pywebview isn't installed in this zone, so the desktop window can't open.")
         warn("Install the app's deps with `zone install`, then run `zone start` again.")
@@ -712,6 +802,9 @@ def cmd_start(args):
         warn(f"Native window unavailable ({e}).")
         _serve_block(url)
     finally:
+        # The server runs in a daemon thread, so returning here exits the process
+        # and closes the socket — nothing else to stop.
+        print("\nStopped.")
         if PID_FILE and os.path.isfile(PID_FILE):
             try: os.remove(PID_FILE)
             except OSError: pass
@@ -961,9 +1054,8 @@ def cmd_build(args):
 def cmd_update(args):
     """Bump the version, rebuild the app payload, and rebuild the setup file.
 
-    This is the 'build and update the app locally + refresh the setup file'
-    one-shot: it bumps the version (so the new local build carries a new number),
-    repackages the release zip/manifest, and rebuilds the installer.
+    One-shot local update: bumps the version so the new build carries a fresh
+    number, repackages the release zip/manifest, then rebuilds the installer.
     """
     if not args.no_bump:
         head(f"Bumping version ({args.part})")
@@ -986,6 +1078,7 @@ def cmd_refresh(args):
         ok("Dependencies up to date.")
     if not args.no_migrate:
         try:
+            args.no_assets = True  # refresh does its own touch_static below
             cmd_migrate(args)
         except SystemExit:
             warn("Skipped migrate (database not reachable).")
@@ -1028,8 +1121,13 @@ def build_parser():
                         needs_venv=needs_venv)
         return sp
 
-    add("version", cmd_version, "Show zone / Python / zone versions.",
+    add("version", cmd_version, "Show zone CLI / Python / app versions.",
         needs_zone=False, needs_app=False, needs_venv=False)
+
+    add("upgrade", cmd_upgrade, "Upgrade the zone CLI itself to the latest.",
+        aliases=("self-update",), needs_zone=False, needs_app=False, needs_venv=False) \
+        .add_argument("--force", action="store_true",
+                      help="Reinstall even if already on the latest version.")
 
     sp = add("init", cmd_init, "Create a new zone (workspace + shared .venv + apps/).",
              needs_zone=False, needs_app=False, needs_venv=False)
@@ -1052,7 +1150,9 @@ def build_parser():
         needs_venv=False) \
         .add_argument("--build", action="store_true", help="Also install build deps.")
     add("initdb", cmd_initdb, "Create database, tables, and default admin.", aliases=("init-db",))
-    add("migrate", cmd_migrate, "Apply idempotent schema upgrades.")
+    add("migrate", cmd_migrate, "Apply schema upgrades and refresh static assets.") \
+        .add_argument("--no-assets", action="store_true",
+                      help="Skip refreshing static assets (DB schema only).")
     add("seed", cmd_seed, "Insert sample products.")
 
     sp = add("start", cmd_start,
@@ -1062,6 +1162,8 @@ def build_parser():
     sp.add_argument("--host", help="Host (default from config).")
     sp.add_argument("--no-window", action="store_true",
                     help="Don't open the desktop window; just serve with live logs.")
+    sp.add_argument("--no-version-check", action="store_true",
+                    help="Skip the zone CLI update check on startup.")
 
     sp = add("serve", cmd_serve, "Run the Flask dev server headless (logs only, no window).")
     sp.add_argument("--port", type=int, help="Port (default from config).")
@@ -1165,4 +1267,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl+C anywhere: exit quietly with the conventional code, no traceback.
+        print()
+        raise SystemExit(130)
