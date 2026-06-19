@@ -35,7 +35,7 @@ try:
 except Exception:
     pass
 
-ZONE_VERSION = "1.0.1"
+ZONE_VERSION = "1.0.3"
 # Where the zone CLI itself lives, for version checks and `zone upgrade`.
 ZONE_REPO = os.environ.get("ZONE_REPO", "ZonalTech/Zone")
 
@@ -1511,7 +1511,49 @@ def build_parser():
     return p
 
 
+def _ensure_on_path():
+    """Self-register zone.exe's folder on the user PATH (Windows) — pip can't.
+
+    pip installs zone.exe into the interpreter's Scripts dir, which often isn't
+    on PATH, so `zone` won't resolve. On first run (via `py -m zone` or the exe)
+    we add that dir to the persistent user PATH and the current process. Quiet
+    and idempotent; safe to call every run.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import sysconfig
+        d = sysconfig.get_path("scripts")
+        # Only act when THIS interpreter actually owns a zone.exe (skip venv
+        # re-exec children, where zone isn't installed).
+        if not d or not os.path.isfile(os.path.join(d, "zone.exe")):
+            return
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:
+                cur, _ = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                cur = ""
+            parts = [p for p in cur.split(os.pathsep) if p]
+            if any(os.path.normcase(p) == os.path.normcase(d) for p in parts):
+                return  # already on PATH
+            winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ,
+                              os.pathsep.join(parts + [d]))
+        try:  # nudge already-open shells to reload the environment
+            import ctypes
+            ctypes.windll.user32.SendMessageTimeoutW(
+                0xFFFF, 0x1A, 0, "Environment", 0, 1000, ctypes.byref(ctypes.c_ulong()))
+        except Exception:
+            pass
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + d
+        warn(f"Registered '{d}' on your PATH — open a new terminal and `zone` works everywhere.")
+    except Exception:
+        pass
+
+
 def main(argv=None):
+    _ensure_on_path()
     parser = build_parser()
     raw = sys.argv[1:] if argv is None else list(argv)
     # `zone help` / `zone help <cmd>` → friendly usage (argparse uses -h/--help).
