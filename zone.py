@@ -1,24 +1,27 @@
-"""zonal — a lightweight, "bench"-style development framework for ZT POS.
+"""zone — a small development CLI for ZT POS and apps built on it.
 
-`zonal` is a small CLI you install **once** on your machine. You then use it to
-create and drive any number of independent ZT POS "zones" (one cloned project
-each, like a bench), from setup through serving, migrating, building and
-releasing — instead of remembering a dozen separate scripts and .bat files.
+`zone` is a CLI you install **once** on your machine. You then use it to create
+**zones** (workspaces, each with a shared `.venv` and an `apps/` folder), clone
+apps into them, and drive their whole dev lifecycle (set up, serve, migrate,
+seed, back up, build, release) — instead of remembering a dozen separate
+scripts and .bat files.
 
 Typical flow (Windows):
-    zonal get https://github.com/<org>/zt-pos.git   :: clone a new zone
-    cd zt-pos
-    zonal setup --seed                               :: make .venv, deps, DB, samples
-    zonal start                                      :: dev server + live logs + browser
+    zone init mystore                               :: create a zone (workspace + .venv)
+    cd mystore
+    zone get https://github.com/<org>/zt-pos.git    :: clone an app into apps/
+    zone setup zt-pos --seed                        :: .env, deps, DB, samples
+    zone start zt-pos                               :: dev server: live logs + native window
 
-How it locates a zone:
-    Every command (except `get`/`version`/`help`) operates on the zone that
-    contains the current directory — zonal walks up from the CWD looking for a
-    ZT POS project (an `app.py` + `config.py` pair), exactly like `bench` finds
-    its bench root. Commands that run POS code re-exec themselves inside that
-    zone's `.venv`, so each zone stays isolated.
+How it locates a zone and app:
+    Every command (except `init`/`get`/`version`/`help`) operates on the zone
+    that contains the current directory — `zone` walks up from the CWD looking
+    for the `.zone/zone.json` marker. It then targets the named app (`zone start
+    zt-pos`), the app whose folder you're in, or the zone's only app. Commands
+    that run app code re-exec inside the zone's shared `.venv`, so zones stay
+    isolated.
 
-Run `zonal help` (or `zonal <command> -h`) for the full command list.
+Run `zone help` (or `zone <command> -h`) for the full command list.
 """
 import argparse
 import os
@@ -33,17 +36,15 @@ try:
 except Exception:
     pass
 
-ZONAL_VERSION = "0.3.0"
+ZONE_VERSION = "0.3.0"
 
-# A zone is a workspace (created by `zonal init`) holding a shared .venv and an
-# apps/ folder; apps are cloned into apps/<name> by `zonal get`. The globals
-# below are bound in main(): ZONE = the zone root, ROOT = the active app dir.
-ZONE = None         # zone root (holds .venv, .zonal/, apps/)
-ROOT = None         # active app directory  (apps/<name>) — what commands act on
-STATE_DIR = None    # <zone>/.zonal
-PID_FILE = None     # <zone>/.zonal/serve-<app>.pid
+# Bound in main() once the zone and active app are located.
+ZONE = None         # zone root (holds .venv, .zone/, apps/)
+ROOT = None         # active app directory (apps/<name>)
+STATE_DIR = None    # <zone>/.zone
+PID_FILE = None     # <zone>/.zone/serve-<app>.pid
 
-ZONE_MARKER = os.path.join(".zonal", "zone.json")
+ZONE_MARKER = os.path.join(".zone", "zone.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -56,7 +57,7 @@ def is_app(path):
 
 
 def is_zone_root(path):
-    """A directory is a zone root if it carries the .zonal/zone.json marker."""
+    """A directory is a zone root if it carries the .zone/zone.json marker."""
     return os.path.isfile(os.path.join(path, ZONE_MARKER))
 
 
@@ -102,16 +103,16 @@ def resolve_app(zone, explicit=None, start=None):
     if len(apps) == 1:
         return os.path.join(ad, apps[0])
     if not apps:
-        die("This zone has no apps yet — add one with:  zonal get <repo-url>")
+        die("This zone has no apps yet — add one with:  zone get <repo-url>")
     die("This zone has several apps — name one:\n  "
-        + ", ".join(apps) + f"\n  e.g.  zonal start {apps[0]}   "
+        + ", ".join(apps) + f"\n  e.g.  zone start {apps[0]}   "
         f"(or add  --app {apps[0]}  to other commands)")
 
 
 def _set_zone(zone):
     global ZONE, STATE_DIR
     ZONE = zone
-    STATE_DIR = os.path.join(zone, ".zonal")
+    STATE_DIR = os.path.join(zone, ".zone")
 
 
 def _set_app(app_dir):
@@ -126,7 +127,7 @@ def venv_dir(zone):
 
 
 def venv_python(zone):
-    """Path to the zone's shared venv interpreter (created by `zonal init`)."""
+    """Path to the zone's shared venv interpreter (created by `zone init`)."""
     if os.name == "nt":
         return os.path.join(zone, ".venv", "Scripts", "python.exe")
     return os.path.join(zone, ".venv", "bin", "python")
@@ -146,17 +147,15 @@ def in_zone_venv(zone):
 
 
 def reexec_in_venv(zone, app_dir, argv):
-    """Re-run `zonal <argv>` under the zone's venv, anchored in the app dir.
+    """Re-run `zone <argv>` under the zone's venv, anchored in the app dir.
 
-    App code (app, config, models, …) is installed in the zone's shared venv,
-    not in whatever interpreter launched zonal, so any command that imports it
-    bounces through here first. cwd=app_dir means the child re-resolves the same
-    app from its location; ZONAL_IN_VENV stops it from bouncing again.
+    App code lives in the zone's venv, so commands that import it bounce here.
+    cwd=app_dir lets the child re-resolve the same app; ZONE_IN_VENV stops loops.
     """
     py = venv_python(zone)
     if not os.path.isfile(py):
-        die("This zone has no virtual environment yet — run `zonal init` (or `zonal setup`).")
-    env = dict(os.environ, ZONAL_IN_VENV="1")
+        die("This zone has no virtual environment yet — run `zone init` (or `zone setup`).")
+    env = dict(os.environ, ZONE_IN_VENV="1")
     return subprocess.call([py, os.path.abspath(__file__), *argv], cwd=app_dir, env=env)
 
 
@@ -183,7 +182,7 @@ def confirm(prompt):
 
 
 def run_bat(name, *args):
-    """Run a project .bat (Windows-only build/release helpers)."""
+    """Run one of the app's .bat helpers (Windows-only build/release scripts)."""
     path = os.path.join(ROOT, name)
     if not os.path.isfile(path):
         die(f"{name} not found in {ROOT}")
@@ -193,7 +192,7 @@ def run_bat(name, *args):
 
 
 def _write_pidfile(pid, argv):
-    """Record the running dev server so `zonal restart`/`refresh` can find it."""
+    """Record the running dev server so `zone restart`/`refresh` can find it."""
     import json
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(PID_FILE, "w", encoding="utf-8") as fh:
@@ -235,13 +234,13 @@ def terminate_pid(pid):
 
 
 def _relaunch_serve(argv):
-    """Start `zonal serve/start …` again, detached, in its own console/session.
+    """Start `zone serve/start …` again, detached, in its own console/session.
 
     Called from inside the zone's venv (restart/refresh both run there), so
-    sys.executable is already the venv Python; ZONAL_IN_VENV keeps it that way.
+    sys.executable is already the venv Python; ZONE_IN_VENV keeps it that way.
     """
     cmd = [sys.executable, os.path.abspath(__file__)] + argv
-    env = dict(os.environ, ZONAL_IN_VENV="1")
+    env = dict(os.environ, ZONE_IN_VENV="1")
     if os.name == "nt":
         CREATE_NEW_CONSOLE = 0x00000010
         subprocess.Popen(cmd, cwd=ROOT, creationflags=CREATE_NEW_CONSOLE, env=env)
@@ -300,16 +299,16 @@ def find_mariadb_tool(*names):
 # Commands
 # --------------------------------------------------------------------------- #
 def cmd_version(args):
-    print(f"zonal CLI   v{ZONAL_VERSION}")
+    print(f"zone CLI   v{ZONE_VERSION}")
     print(f"Python      {sys.version.split()[0]}")
     zone = find_zone()
     if not zone:
-        print("zone        (none here — create one with `zonal init <name>`)")
+        print("zone        (none here — create one with `zone init <name>`)")
         return
     print(f"zone        {zone}")
     apps = zone_apps(zone)
     if not apps:
-        print("apps        (none yet — add one with `zonal get <repo-url>`)")
+        print("apps        (none yet — add one with `zone get <repo-url>`)")
         return
     for name in apps:
         vf = os.path.join(apps_dir(zone), name, "VERSION")
@@ -318,7 +317,7 @@ def cmd_version(args):
 
 
 def _base_python():
-    """The interpreter used to *build* a zone's venv (zonal's own Python)."""
+    """The interpreter used to *build* a zone's venv (zone's own Python)."""
     return sys.executable
 
 
@@ -331,11 +330,11 @@ def cmd_init(args):
         warn(f"'{zone}' is not empty; initializing a zone in it anyway.")
     head(f"Initializing zone '{name}'")
     os.makedirs(apps_dir(zone), exist_ok=True)
-    os.makedirs(os.path.join(zone, ".zonal"), exist_ok=True)
+    os.makedirs(os.path.join(zone, ".zone"), exist_ok=True)
     if not is_zone_root(zone):
         import json
         with open(os.path.join(zone, ZONE_MARKER), "w", encoding="utf-8") as fh:
-            json.dump({"zone": name, "zonal": ZONAL_VERSION}, fh, indent=2)
+            json.dump({"zone": name, "zone": ZONE_VERSION}, fh, indent=2)
     # Build the zone's shared virtualenv (apps install their deps into it).
     py = venv_python(zone)
     if os.path.isfile(py):
@@ -349,7 +348,7 @@ def cmd_init(args):
         ok("Created .venv")
     ok(f"Zone ready at {zone}")
     cd = "" if zone == os.path.abspath(os.getcwd()) else f"  cd {args.name}\n"
-    print(f"\nNext:\n{cd}  zonal get <repo-url>   :: clone an app (e.g. ZT POS) into the zone")
+    print(f"\nNext:\n{cd}  zone get <repo-url>   :: clone an app (e.g. ZT POS) into the zone")
 
 
 def cmd_get(args):
@@ -377,13 +376,13 @@ def cmd_get(args):
     if has_venv(ZONE) and os.path.isfile(req):
         head(f"Installing {name}'s dependencies into the zone .venv")
         if _pip_install_venv(["-r", "requirements.txt"], cwd=dest, quiet=True) != 0:
-            warn("Dependency install hit an error — re-run `zonal setup` after checking it.")
+            warn("Dependency install hit an error — re-run `zone setup` after checking it.")
         else:
             ok("Dependencies installed.")
     elif not has_venv(ZONE):
-        warn("Zone has no .venv (was it created with `zonal init`?). Run `zonal setup` next.")
+        warn("Zone has no .venv (was it created with `zone init`?). Run `zone setup` next.")
     ok(f"App added at apps/{name}")
-    print(f"  Set up & run it:  zonal setup {name} --seed   then   zonal start {name}")
+    print(f"  Set up & run it:  zone setup {name} --seed   then   zone start {name}")
 
 
 def _pip_install_venv(pip_args, cwd=None, quiet=False):
@@ -394,7 +393,7 @@ def _pip_install_venv(pip_args, cwd=None, quiet=False):
 
 
 def _ensure_zone_venv():
-    """Make sure the zone venv exists (it normally does, from `zonal init`)."""
+    """Make sure the zone venv exists (it normally does, from `zone init`)."""
     py = venv_python(ZONE)
     if os.path.isfile(py):
         return py
@@ -432,24 +431,104 @@ def cmd_ensure_env(args=None):
         return
     if os.path.isfile(example):
         shutil.copyfile(example, env_path)
-        ok("Created .env from .env.example — edit it if your MariaDB password differs.")
+        ok("Created .env from .env.example.")
     else:
         warn("No .env or .env.example found; using built-in defaults (root / pos_db).")
 
 
+def _env_path():
+    return os.path.join(ROOT, ".env")
+
+
+def _read_env_value(key):
+    """Read KEY's value from the app's .env (None if the file/key is absent)."""
+    p = _env_path()
+    if not os.path.isfile(p):
+        return None
+    for line in open(p, encoding="utf-8"):
+        s = line.strip()
+        if s.startswith(key + "="):
+            return s[len(key) + 1:]
+    return None
+
+
+def _set_env_var(key, value):
+    """Set/replace KEY=value in the app's .env (creating the file if needed)."""
+    p = _env_path()
+    lines = open(p, encoding="utf-8").read().splitlines() if os.path.isfile(p) else []
+    for i, l in enumerate(lines):
+        s = l.lstrip()
+        if s.startswith(key + "=") or s.startswith("#" + key + "="):
+            lines[i] = f"{key}={value}"
+            break
+    else:
+        lines.append(f"{key}={value}")
+    open(p, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+
+
+def _is_db_auth_error(exc):
+    """True if a DB error looks like bad/missing credentials (vs. server down)."""
+    msg = str(exc).lower()
+    return any(s in msg for s in (
+        "access denied", "authentication plugin", "1045", "1698", "2059",
+        "using password",
+    ))
+
+
+def _prompt_db_password(force=False):
+    """Make sure .env carries a DB password before we create the database.
+
+    The default .env ships with an empty DB_PASSWORD, which makes MariaDB try an
+    auth plugin pymysql can't speak (error 2059). So if no password is set yet,
+    prompt for the MariaDB user's password (hidden) and save it to .env.
+    """
+    import getpass
+    if not force and os.environ.get("ZONE_DB_PROMPTED"):
+        return
+    user = _read_env_value("DB_USER") or "root"
+    pw = _read_env_value("DB_PASSWORD")
+    if pw and not force:
+        return  # already configured
+    if not (sys.stdin and sys.stdin.isatty()):
+        return  # non-interactive: leave .env as-is and let the connection speak
+    head("MariaDB credentials")
+    print(f"  Enter the MariaDB password for user '{user}' so the database can be created.")
+    print("  (Press Enter to leave it blank only if this MariaDB truly has no password.)")
+    try:
+        entered = getpass.getpass(f"  {user} password: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    _set_env_var("DB_USER", user)
+    _set_env_var("DB_PASSWORD", entered)
+    ok("Saved DB credentials to .env")
+
+
 def cmd_initdb(args):
     """Create the database, all tables, and the default admin (idempotent)."""
-    import init_db
+    # Ensure a password is set first — .env is read at import time below, so this
+    # has to run before `import init_db` pulls in config.
+    _prompt_db_password()
     head("Initializing database")
     try:
+        import init_db
         init_db.create_database()
         init_db.create_tables()
         if init_db.ensure_default_admin():
             ok(f"Created default admin '{init_db.DEFAULT_ADMIN['username']}' "
                f"(password '{init_db.DEFAULT_ADMIN['password']}') — change it after first login!")
     except Exception as e:
+        # Bad/missing credentials: re-prompt and retry once in a fresh process
+        # (so config re-reads .env). A guard env stops an endless loop.
+        if (_is_db_auth_error(e) and not os.environ.get("ZONE_DB_RETRY")
+                and sys.stdin and sys.stdin.isatty()):
+            warn(f"MariaDB rejected the credentials ({type(e).__name__}).")
+            _prompt_db_password(force=True)
+            os.environ["ZONE_DB_RETRY"] = "1"
+            os.environ["ZONE_DB_PROMPTED"] = "1"
+            raise SystemExit(reexec_in_venv(ZONE, ROOT, ["initdb"]))
         die(f"Could not initialize the database.\n  {type(e).__name__}: {e}\n"
-            f"  Is MariaDB running, and do DB_USER/DB_PASSWORD in .env match?")
+            f"  Is MariaDB running, and is the DB_USER/DB_PASSWORD in .env correct?")
     ok("Database ready.")
 
 
@@ -478,12 +557,7 @@ def cmd_seed(args):
 
 
 def cmd_setup(args):
-    """First-time app setup: .env → deps into the zone .venv → DB → (optionally) seed.
-
-    Runs under zonal's own interpreter (so it can install into the zone venv),
-    then bounces the database steps into that venv where the app code and its
-    dependencies live.
-    """
+    """First-time app setup: .env → deps into the zone .venv → DB → (optionally) seed."""
     head(f"Setting up app '{os.path.basename(ROOT)}'")
     cmd_ensure_env()
     if not args.skip_install:
@@ -494,15 +568,19 @@ def cmd_setup(args):
         ok("Dependencies installed.")
     elif not has_venv(ZONE):
         warn("--skip-install given but this zone has no .venv yet; "
-             "database steps need one. Run `zonal install` first.")
+             "database steps need one. Run `zone install` first.")
         return
+    # Ask for the MariaDB password up front (here, where we're interactive),
+    # save it to .env, and tell the initdb child not to prompt again.
+    _prompt_db_password()
+    os.environ["ZONE_DB_PROMPTED"] = "1"
     # initdb (+ seed) need the app code, so run them inside the zone's venv.
     if reexec_in_venv(ZONE, ROOT, ["initdb"]) != 0:
         die("Database initialization failed.")
     if args.seed and reexec_in_venv(ZONE, ROOT, ["seed"]) != 0:
         die("Seeding failed.")
-    print("\nSetup done. Start the app with:  zonal start   "
-          "(or  zonal launch  for the desktop window)")
+    print("\nSetup done. Start the app with:  zone start   "
+          "(or  zone launch  for the desktop window)")
 
 
 def _pick_port(host, preferred):
@@ -628,7 +706,7 @@ def cmd_start(args):
             webview.start()  # older pywebview without the icon argument
     except ImportError:
         warn("pywebview isn't installed in this zone, so the desktop window can't open.")
-        warn("Install the app's deps with `zonal install`, then run `zonal start` again.")
+        warn("Install the app's deps with `zone install`, then run `zone start` again.")
         _serve_block(url)
     except Exception as e:
         warn(f"Native window unavailable ({e}).")
@@ -640,14 +718,14 @@ def cmd_start(args):
 
 
 def cmd_restart(args):
-    """Stop and relaunch the dev server recorded by `zonal start`/`serve`."""
+    """Stop and relaunch the dev server recorded by `zone start`/`serve`."""
     head("Restarting dev server")
     argv = _stop_running_server()
     if argv is None:
-        warn("No running dev server found (start one with `zonal start`).")
+        warn("No running dev server found (start one with `zone start`).")
         return
     _relaunch_serve(argv)
-    ok(f"Relaunched: zonal {' '.join(argv)} (in a new window).")
+    ok(f"Relaunched: zone {' '.join(argv)} (in a new window).")
 
 
 def cmd_launch(args):
@@ -760,7 +838,7 @@ def cmd_doctor(args):
     """Check that the zone is ready to run the app."""
     # Package checks must run inside the zone's venv to be meaningful, so bounce
     # there when it exists and we aren't already in it.
-    if (has_venv(ZONE) and not os.environ.get("ZONAL_IN_VENV")
+    if (has_venv(ZONE) and not os.environ.get("ZONE_IN_VENV")
             and not in_zone_venv(ZONE)):
         raise SystemExit(reexec_in_venv(ZONE, ROOT, ["doctor"]))
 
@@ -775,7 +853,7 @@ def cmd_doctor(args):
     if has_venv(ZONE):
         ok("Zone .venv present.")
     else:
-        fail("No .venv for this zone (run `zonal init` / `zonal setup`).")
+        fail("No .venv for this zone (run `zone init` / `zone setup`).")
         problems += 1
 
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
@@ -783,14 +861,14 @@ def cmd_doctor(args):
                               else "Not in a virtualenv (recommended: .venv).")
 
     env_ok = os.path.isfile(os.path.join(ROOT, ".env"))
-    (ok if env_ok else warn)(".env present." if env_ok else "No .env (run `zonal setup`).")
+    (ok if env_ok else warn)(".env present." if env_ok else "No .env (run `zone setup`).")
 
     for mod in ("flask", "sqlalchemy", "pymysql", "dotenv", "waitress"):
         try:
             __import__(mod)
             ok(f"package: {mod}")
         except ImportError:
-            fail(f"package missing: {mod} (run `zonal install`)")
+            fail(f"package missing: {mod} (run `zone install`)")
             problems += 1
 
     try:
@@ -805,7 +883,7 @@ def cmd_doctor(args):
         if can_connect(Config.SQLALCHEMY_DATABASE_URI, timeout=4):
             ok(f"Database '{Config.DB_NAME}' reachable.")
         else:
-            warn(f"Database '{Config.DB_NAME}' not found (run `zonal initdb`).")
+            warn(f"Database '{Config.DB_NAME}' not found (run `zone initdb`).")
     except Exception as e:
         fail(f"DB check error: {type(e).__name__}: {e}")
         problems += 1
@@ -915,10 +993,10 @@ def cmd_refresh(args):
     if not args.no_restart:
         argv = _stop_running_server()
         if argv is None:
-            warn("No running dev server to restart (start one with `zonal start`).")
+            warn("No running dev server to restart (start one with `zone start`).")
         else:
             _relaunch_serve(argv)
-            ok(f"Relaunched: zonal {' '.join(argv)} (in a new window).")
+            ok(f"Relaunched: zone {' '.join(argv)} (in a new window).")
     print("\nRefresh done.")
 
 
@@ -933,8 +1011,8 @@ def cmd_release(args):
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="zonal",
-        description="Local development framework for ZT POS (a lightweight 'bench').",
+        prog="zone",
+        description="Development CLI for ZT POS and apps built on it.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("-V", "--version", action="store_true", help="Show versions and exit.")
@@ -950,7 +1028,7 @@ def build_parser():
                         needs_venv=needs_venv)
         return sp
 
-    add("version", cmd_version, "Show zonal / Python / zone versions.",
+    add("version", cmd_version, "Show zone / Python / zone versions.",
         needs_zone=False, needs_app=False, needs_venv=False)
 
     sp = add("init", cmd_init, "Create a new zone (workspace + shared .venv + apps/).",
@@ -978,14 +1056,14 @@ def build_parser():
     add("seed", cmd_seed, "Insert sample products.")
 
     sp = add("start", cmd_start,
-             "Run an app: live logs + native window.  e.g. zonal start zt-pos")
+             "Run an app: live logs + native window.  e.g. zone start zt-pos")
     sp.add_argument("app_name", nargs="?", help="App to run (default: the zone's app).")
     sp.add_argument("--port", type=int, help="Port (default from config).")
     sp.add_argument("--host", help="Host (default from config).")
     sp.add_argument("--no-window", action="store_true",
                     help="Don't open the desktop window; just serve with live logs.")
 
-    sp = add("serve", cmd_serve, "Run the Flask dev server (browser, no auto-open).")
+    sp = add("serve", cmd_serve, "Run the Flask dev server headless (logs only, no window).")
     sp.add_argument("--port", type=int, help="Port (default from config).")
     sp.add_argument("--host", help="Host (default from config).")
     sp.add_argument("--reload", action="store_true", help="Auto-reload on code changes.")
@@ -1040,7 +1118,7 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     raw = sys.argv[1:] if argv is None else list(argv)
-    # `zonal help` / `zonal help <cmd>` → friendly usage (argparse uses -h/--help).
+    # `zone help` / `zone help <cmd>` → friendly usage (argparse uses -h/--help).
     if raw and raw[0] == "help":
         if len(raw) > 1 and raw[1] in parser._subparsers._group_actions[0].choices:
             parser._subparsers._group_actions[0].choices[raw[1]].print_help()
@@ -1059,13 +1137,13 @@ def main(argv=None):
         zone = find_zone()
         if not zone:
             die("Not inside a zone.\n"
-                "  Create one with:  zonal init <name>\n"
-                "  then add an app:  zonal get <repo-url>")
+                "  Create one with:  zone init <name>\n"
+                "  then add an app:  zone get <repo-url>")
         _set_zone(zone)
 
         if getattr(args, "needs_app", True):
             # Pick the app this command targets, move into it, import from it.
-            # Precedence: positional (e.g. `zonal start zt-pos`) > global --app > auto.
+            # Precedence: positional (e.g. `zone start zt-pos`) > global --app > auto.
             explicit = getattr(args, "app_name", None) or getattr(args, "app", None)
             app_dir = resolve_app(zone, explicit=explicit)
             _set_app(app_dir)
@@ -1075,10 +1153,10 @@ def main(argv=None):
 
             # Commands that import app code run under the zone's shared .venv.
             if (getattr(args, "needs_venv", True)
-                    and not os.environ.get("ZONAL_IN_VENV")
+                    and not os.environ.get("ZONE_IN_VENV")
                     and not in_zone_venv(zone)):
                 if not has_venv(zone):
-                    die("This zone has no virtual environment yet — run `zonal setup` first.")
+                    die("This zone has no virtual environment yet — run `zone setup` first.")
                 raise SystemExit(reexec_in_venv(zone, app_dir, raw))
         else:
             os.chdir(zone)  # zone-only commands (e.g. `get`) operate at the root

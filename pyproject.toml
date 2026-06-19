@@ -3,19 +3,19 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "zonal"
+name = "zone"
 version = "0.3.0"
-description = "A lightweight, bench-style development CLI for ZT POS."
+description = "Development CLI for ZT POS and apps built on it."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "Zonal Tech" }]
-keywords = ["zt-pos", "bench", "cli", "flask"]
-# zonal itself is pure-stdlib; each zone's app dependencies live in that zone's
-# own .venv (installed by `zonal setup`/`zonal install`), not here.
+keywords = ["zt-pos", "cli", "flask"]
+# zone itself is pure-stdlib; each zone's app dependencies live in that zone's
+# own .venv (installed by `zone setup`/`zone install`), not here.
 dependencies = []
 
 [project.scripts]
-zonal = "zonal:main"
+zone = "zone:main"
 
 [tool.setuptools]
-py-modules = ["zonal"]
+py-modules = ["zone"]
