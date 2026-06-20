@@ -496,6 +496,36 @@ def _ensure_zone_in_venv(zone, py=None, force=False):
     return False
 
 
+def _install_framework_dev(zone, py):
+    """Clone the framework (the zone CLI itself) into the zone, install editable.
+
+    A `--dev` zone is for working ON the framework, not just running apps. Instead
+    of the usual pinned `pip install git+…`, it gets a real git checkout of the
+    framework at <zone>/framework and an editable install of it, so the in-zone
+    `zone` command runs from that checkout and edits to it are picked up live.
+    Apps (e.g. the POS) are added afterwards with `zone get`.
+    """
+    git = shutil.which("git")
+    if not git:
+        die("git is required for a --dev zone (it clones the framework).\n"
+            "  Install Git for Windows and retry.")
+    fw = os.path.join(zone, "framework")
+    if os.path.isdir(fw) and os.listdir(fw):
+        warn("framework/ already exists — leaving the checkout as-is.")
+    else:
+        url = f"https://github.com/{ZONE_REPO}.git"
+        head(f"Cloning the framework → framework/  ({ZONE_REPO})")
+        if subprocess.call([git, "clone", url, fw]) != 0:
+            die("git clone of the framework failed.")
+    head("Installing the framework into the zone .venv (editable)")
+    if subprocess.call([py, "-m", "pip", "install", "-q", "-e", fw]) == 0 \
+            and venv_has_zone(zone):
+        ok("Framework installed editable — edit framework/zone.py, changes are live.")
+    else:
+        warn("Editable framework install hit an error; "
+             "venv commands will fall back to the global CLI.")
+
+
 def cmd_init(args):
     """Create a new zone: a workspace with its own shared .venv and apps/ folder."""
     zone = os.path.abspath(args.name or ".")
@@ -511,7 +541,8 @@ def cmd_init(args):
         with open(os.path.join(zone, ZONE_MARKER), "w", encoding="utf-8") as fh:
             json.dump({"zone": name, "created_with": ZONE_VERSION,
                        "cli_source": _zone_install_source(),
-                       "cli_in_venv": not args.no_cli}, fh, indent=2)
+                       "cli_in_venv": not args.no_cli,
+                       "dev": bool(args.dev)}, fh, indent=2)
     # Build the zone's shared virtualenv (apps install their deps into it).
     py = venv_python(zone)
     if os.path.isfile(py):
@@ -523,16 +554,20 @@ def cmd_init(args):
             die("Could not create .venv (is the base Python's venv module available?).")
         subprocess.call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
         ok("Created .venv")
-    # Install the zone CLI into the zone's own .venv so the zone is self-contained
-    # (like `bench init` installing frappe-bench into a bench's env), unless opted out.
-    if not args.no_cli:
+    # A --dev zone clones the framework itself (editable) so you can develop the
+    # CLI; a normal zone installs the pinned CLI into its own .venv, like
+    # `bench init` installing frappe-bench into a bench's env (unless opted out).
+    if args.dev:
+        _install_framework_dev(zone, py)
+    elif not args.no_cli:
         _ensure_zone_in_venv(zone, py)
     ok(f"Zone ready at {zone}")
 
     # Scaffold a starter app into apps/ (named after the zone) unless opted out,
-    # so the new zone has something to run immediately.
+    # so the new zone has something to run immediately. A --dev zone skips this:
+    # the framework is the point, and real apps are added later with `zone get`.
     app_name = None
-    if not args.no_app:
+    if not args.dev and not args.no_app:
         app_name = args.app_name or name
         dest = os.path.join(apps_dir(zone), app_name)
         if os.path.exists(dest) and os.listdir(dest):
@@ -547,7 +582,11 @@ def cmd_init(args):
                 warn(f"Scaffolded apps/{app_name}, but dependency install hit an error.")
 
     cd = "" if zone == os.path.abspath(os.getcwd()) else f"  cd {os.path.basename(zone)}\n"
-    if app_name:
+    if args.dev:
+        print(f"\nDev zone ready (framework checked out at framework/).\n{cd}"
+              f"  edit framework/zone.py   :: the CLI/framework source (live, editable)\n"
+              f"  zone get <repo-url>      :: add an app (e.g. the POS) into apps/")
+    elif app_name:
         print(f"\nNext:\n{cd}  zone start {app_name}        :: run the starter app\n"
               f"  zone get <repo-url>   :: or clone another app into the zone")
     else:
@@ -1513,6 +1552,10 @@ def build_parser():
     sp.add_argument("--no-cli", action="store_true",
                     help="Don't install the zone CLI into the zone's .venv "
                          "(use the global CLI for this zone instead).")
+    sp.add_argument("--dev", action="store_true",
+                    help="Development zone: clone the framework into framework/ and "
+                         "install it editable (no starter template). Add apps with "
+                         "`zone get`.")
 
     sp = add("get", cmd_get, "Clone an app from GitHub into this zone's apps/.",
              aliases=("clone",), needs_app=False, needs_venv=False)

@@ -19,6 +19,7 @@ a single command.
 - **Native development window** — `zone start` runs the app in a desktop window with live logs (no browser).
 - **Live reload** — `zone start --reload` picks up code and template edits automatically.
 - **Self-contained zones** — like a frappe bench, `zone init` installs the CLI into the zone's own `.venv`, pinning each zone to the version it was created with.
+- **Develop the framework** — `zone init --dev` clones this CLI into the zone (`framework/`, installed editable) so you can hack on `zone` itself, with edits live.
 - **No dependencies of its own** — `zone` is pure stdlib; each app's packages live in its zone's `.venv`.
 
 ---
@@ -73,6 +74,55 @@ zone start <your-app>
 
 ---
 
+## Developing the framework
+
+To work on the CLI itself, create a **dev zone**. `--dev` clones this framework
+into `framework/` and installs it **editable**, so the in-zone `zone` runs from
+that checkout and your edits to `framework/zone.py` take effect immediately — no
+starter template; add real apps afterwards with `zone get`.
+
+```bat
+zone init zonedev --dev                              :: clone framework/ (editable)
+cd zonedev
+zone get https://github.com/ZonalTech/zt-pos.git     :: add an app to test against
+zone start zt-pos --reload                            :: run it; edits to the CLI are live
+```
+
+A dev zone's layout:
+
+```
+zonedev/
+|- .venv/                <- framework installed editable (-e framework)
+|- .zone/zone.json       <- {"dev": true, ...}
+|- framework/            <- git checkout of this CLI (edit me)
+`- apps/                 <- empty until `zone get`
+```
+
+---
+
+## Build and release an app
+
+Run from inside an app, or from anywhere in the zone with `zone --app <name> …`.
+These wrap the app's own build/release scripts:
+
+```bat
+zone build                 :: build the app payload (e.g. POS.exe + release zip + manifest)
+zone build setup           :: build the installer
+zone build all             :: both
+
+zone bump                  :: bump the patch version + changelog (also: minor | major | X.Y.Z)
+zone update                :: bump version + rebuild app payload + rebuild installer
+zone update minor          :: same, bumping the minor version
+zone update --no-bump      :: rebuild at the current version
+zone update --no-setup     :: skip rebuilding the installer
+
+zone release               :: publish a GitHub release
+```
+
+Typical ship flow:  `zone update`  →  `zone release`.
+
+---
+
 ## Zones and applications
 
 A **zone** is a workspace; **applications** live inside it and share the zone's `.venv`:
@@ -103,7 +153,7 @@ by:
 
 | Command | Description |
 |---------|-------------|
-| `zone init [NAME] [--app-name N] [--no-app] [--no-cli]` | Create a zone (`.venv` with the zone CLI installed into it, plus a starter app). `--no-cli` skips installing the CLI into the `.venv`; `--no-app` skips the starter app. |
+| `zone init [NAME] [--app-name N] [--no-app] [--no-cli] [--dev]` | Create a zone (`.venv` with the zone CLI installed into it, plus a starter app). `--no-cli` skips installing the CLI into the `.venv`; `--no-app` skips the starter app; `--dev` clones the framework into `framework/` and installs it editable (no starter app) for working on the CLI itself. |
 | `zone new NAME` | Scaffold another minimal application into `apps/`. |
 | `zone get REPO [NAME] [--branch B]` | Clone an application from GitHub into `apps/`. |
 | `zone setup [APP] [--seed] [--skip-install]` | `.env`, dependencies, database, and optional sample data. |
