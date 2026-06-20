@@ -1,17 +1,16 @@
 @echo off
-REM ===== Install the zone CLI globally on this machine (Windows) =====
-REM Installs once into your real Python so `zone` works from ANY directory.
-REM No path switching afterwards.
+REM ===== Install the zone CLI (Windows) =====
+REM Installs the CLI and registers `zone` on PATH so plain `zone` commands work
+REM immediately - no reload, no `py -m`.
 setlocal
 set "HERE=%~dp0"
 
-REM Editors like VS Code auto-activate a project's .venv in the terminal, which
-REM hijacks pip. Drop any active virtualenv and use the `py` launcher so we
-REM install into the real, global Python. zone has no dependencies of its own.
+REM Editors auto-activate a project's .venv in the terminal, which hijacks pip.
+REM Drop any active virtualenv and use the `py` launcher to hit the real Python.
 set "VIRTUAL_ENV="
 where py >nul 2>nul && (set "PY=py") || (set "PY=python")
 
-echo Installing the zone CLI globally with %PY% ...
+echo Installing the zone CLI with %PY% ...
 %PY% -m pip install "%HERE%."
 if errorlevel 1 (
     echo.
@@ -24,18 +23,16 @@ if errorlevel 1 (
     )
 )
 
-REM Self-register zone.exe's folder on PATH (the CLI does this on first run).
+REM Register `zone` by running the freshly installed executable once. That drops
+REM a launcher into a folder already on PATH, so `zone` resolves right away.
 echo Registering 'zone' on your PATH ...
-%PY% -m zone --version
+for /f "delims=" %%S in ('%PY% -c "import sysconfig;print(sysconfig.get_path('scripts'))"') do set "SCR=%%S"
+if exist "%SCR%\zone.exe" ("%SCR%\zone.exe" --version)
 
 echo.
-echo Done. Open a NEW terminal, then from ANY folder run:
+echo Done. Plain `zone` commands now work - no reload needed:
 echo     zone --version
-echo.
-echo Create your first zone and run an app:
 echo     zone init mystore
 echo     cd mystore
-echo     zone get https://github.com/ZonalTech/^<your-app^>.git
-echo     zone setup zt-pos --seed
-echo     zone start zt-pos
+echo     zone start mystore
 endlocal

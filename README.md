@@ -37,14 +37,24 @@ a single command.
 
 ## Installation
 
+Clone the repository and run the installer:
+
 ```bat
-py -m pip install "git+https://github.com/ZonalTech/Zone.git"
-py -m zone --version
+git clone https://github.com/ZonalTech/Zone.git
+cd Zone
+install.bat
 ```
 
-pip cannot modify `PATH`, so the first run registers it for you. Open a new
-terminal (or reload your editor) afterwards and `zone` will resolve from any
-directory. The bundled `install.bat` performs both steps in one go.
+`install.bat` installs the CLI and registers `zone` on your `PATH`, so plain
+`zone` commands work immediately — no reload, and no `py -m`. Verify with:
+
+```bat
+zone --version
+```
+
+> Why the installer? pip cannot modify `PATH` and a bare `zone` cannot register
+> itself the first time, so `install.bat` performs that one-time setup for you.
+> After it runs, you only ever type clean `zone` commands.
 
 ---
 
@@ -134,8 +144,15 @@ by:
 
 ## Update and uninstall
 
+Update the CLI to the latest version:
+
 ```bat
-py -m pip install --user --upgrade "git+https://github.com/ZonalTech/Zone.git"
+zone upgrade
+```
+
+Uninstall:
+
+```bat
 py -m pip uninstall zone
 ```
 

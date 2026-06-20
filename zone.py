@@ -35,7 +35,7 @@ try:
 except Exception:
     pass
 
-ZONE_VERSION = "1.0.7"
+ZONE_VERSION = "1.0.8"
 # Where the zone CLI itself lives, for version checks and `zone upgrade`.
 ZONE_REPO = os.environ.get("ZONE_REPO", "ZonalTech/Zone")
 
