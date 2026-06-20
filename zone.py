@@ -35,7 +35,7 @@ try:
 except Exception:
     pass
 
-ZONE_VERSION = "1.0.10"
+ZONE_VERSION = "1.0.11"
 # Where the zone CLI itself lives, for version checks and `zone upgrade`.
 ZONE_REPO = os.environ.get("ZONE_REPO", "ZonalTech/Zone")
 
@@ -1585,29 +1585,30 @@ def _ensure_on_path():
         if not d or not os.path.isfile(os.path.join(d, "zone.exe")):
             return
 
-        on_path = any(os.path.normcase(p) == os.path.normcase(d)
-                      for p in os.environ.get("PATH", "").split(os.pathsep))
-        if on_path:
-            return  # already resolvable; nothing to do
+        # Already resolvable? Either the Scripts dir is on PATH, or a `zone`
+        # launcher (zone.cmd/zone.exe) already sits in a PATH dir. If so, do
+        # nothing — and stay silent (no per-command noise).
+        dn = os.path.normcase(os.path.abspath(d))
+        for raw in os.environ.get("PATH", "").split(os.pathsep):
+            p = raw.strip().strip('"')
+            if not p:
+                continue
+            if os.path.normcase(os.path.abspath(p)) == dn:
+                return
+            if (os.path.isfile(os.path.join(p, "zone.cmd"))
+                    or os.path.isfile(os.path.join(p, "zone.exe"))):
+                return
 
-        added_reg = _add_to_user_path(d)
+        # Not resolvable yet — register once, silently.
+        _add_to_user_path(d)
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + d
-
-        # Drop a launcher into an already-on-PATH dir for no-reload resolution.
-        shim_made = False
         shim_dir = _writable_user_dir_on_path(exclude=d)
         if shim_dir:
             try:
                 with open(os.path.join(shim_dir, "zone.cmd"), "w", encoding="ascii") as fh:
                     fh.write(_ZONE_CMD)
-                shim_made = True
             except Exception:
                 pass
-
-        if shim_made:
-            ok("`zone` is now on your PATH — works in this terminal right away.")
-        elif added_reg:
-            warn(f"Registered '{d}' on your PATH — open a new terminal to use `zone`.")
     except Exception:
         pass
 
