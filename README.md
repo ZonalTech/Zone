@@ -37,28 +37,15 @@ a single command.
 
 ## Installation
 
-Clone the repository and run the installer:
+Fetch and install the CLI from GitHub (no clone needed):
 
 ```bat
-git clone https://github.com/ZonalTech/Zone.git
-cd Zone
-.\install.bat
+py -m pip install "git+https://github.com/ZonalTech/Zone.git"
+py -m zone --version
 ```
 
-> In PowerShell, scripts in the current folder need the `.\` prefix
-> (`.\install.bat`). In Command Prompt, `install.bat` works as-is. If you
-> already cloned the repo, skip `git clone` and just run `.\install.bat`.
-
-`install.bat` installs the CLI and registers `zone` on your `PATH`, so plain
-`zone` commands work immediately — no reload, and no `py -m`. Verify with:
-
-```bat
-zone --version
-```
-
-> Why the installer? pip cannot modify `PATH` and a bare `zone` cannot register
-> itself the first time, so `install.bat` performs that one-time setup for you.
-> After it runs, you only ever type clean `zone` commands.
+The one-time `py -m zone --version` registers `zone` on your `PATH`. After that,
+use plain `zone` commands from any directory.
 
 ---
 
