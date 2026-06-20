@@ -42,8 +42,12 @@ Clone the repository and run the installer:
 ```bat
 git clone https://github.com/ZonalTech/Zone.git
 cd Zone
-install.bat
+.\install.bat
 ```
+
+> In PowerShell, scripts in the current folder need the `.\` prefix
+> (`.\install.bat`). In Command Prompt, `install.bat` works as-is. If you
+> already cloned the repo, skip `git clone` and just run `.\install.bat`.
 
 `install.bat` installs the CLI and registers `zone` on your `PATH`, so plain
 `zone` commands work immediately — no reload, and no `py -m`. Verify with:
