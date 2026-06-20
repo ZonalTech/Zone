@@ -35,7 +35,7 @@ try:
 except Exception:
     pass
 
-ZONE_VERSION = "1.0.5"
+ZONE_VERSION = "1.0.7"
 # Where the zone CLI itself lives, for version checks and `zone upgrade`.
 ZONE_REPO = os.environ.get("ZONE_REPO", "ZonalTech/Zone")
 
@@ -1511,13 +1511,69 @@ def build_parser():
     return p
 
 
-def _ensure_on_path():
-    """Self-register zone.exe's folder on the user PATH (Windows) — pip can't.
+# A version-agnostic launcher: forwards `zone …` to `py -m zone …` (falls back
+# to python). No hardcoded interpreter path, so it survives Python upgrades.
+_ZONE_CMD = (
+    "@echo off\r\n"
+    "where py >nul 2>nul\r\n"
+    "if %errorlevel%==0 (py -m zone %*) else (python -m zone %*)\r\n"
+)
 
-    pip installs zone.exe into the interpreter's Scripts dir, which often isn't
-    on PATH, so `zone` won't resolve. On first run (via `py -m zone` or the exe)
-    we add that dir to the persistent user PATH and the current process. Quiet
-    and idempotent; safe to call every run.
+
+def _add_to_user_path(directory):
+    """Append `directory` to the persistent user PATH (registry). True if added."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                        winreg.KEY_READ | winreg.KEY_WRITE) as key:
+        try:
+            cur, _ = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            cur = ""
+        parts = [p for p in cur.split(os.pathsep) if p]
+        if any(os.path.normcase(p) == os.path.normcase(directory) for p in parts):
+            return False
+        winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ,
+                          os.pathsep.join(parts + [directory]))
+    try:  # tell Explorer / new shells to reload the environment
+        import ctypes
+        ctypes.windll.user32.SendMessageTimeoutW(
+            0xFFFF, 0x1A, 0, "Environment", 0, 1000, ctypes.byref(ctypes.c_ulong()))
+    except Exception:
+        pass
+    return True
+
+
+def _writable_user_dir_on_path(exclude):
+    """First writable directory already on PATH and under the user profile —
+    somewhere a `zone` launcher resolves WITHOUT reopening the shell."""
+    home = os.path.normcase(os.path.abspath(os.path.expanduser("~")))
+    exclude = os.path.normcase(os.path.abspath(exclude))
+    for raw in os.environ.get("PATH", "").split(os.pathsep):
+        p = raw.strip().strip('"')
+        if not p or not os.path.isdir(p):
+            continue
+        np = os.path.normcase(os.path.abspath(p))
+        if np == exclude or not np.startswith(home) or "windowsapps" in np:
+            continue
+        probe = os.path.join(p, ".zone_write_test")
+        try:
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            return p
+        except Exception:
+            continue
+    return None
+
+
+def _ensure_on_path():
+    """Make `zone` runnable globally (Windows) — pip can't touch PATH itself.
+
+    pip drops zone.exe into the interpreter's Scripts dir, which often isn't on
+    PATH. On first run we (1) add that dir to the persistent user PATH for future
+    shells, and (2) drop a `zone.cmd` launcher (`py -m zone`) into a directory
+    already on PATH so `zone` resolves in the CURRENT shell too — no reload.
+    Quiet and idempotent; safe to call every run.
     """
     if os.name != "nt":
         return
@@ -1528,26 +1584,30 @@ def _ensure_on_path():
         # re-exec children, where zone isn't installed).
         if not d or not os.path.isfile(os.path.join(d, "zone.exe")):
             return
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
-                            winreg.KEY_READ | winreg.KEY_WRITE) as key:
-            try:
-                cur, _ = winreg.QueryValueEx(key, "Path")
-            except FileNotFoundError:
-                cur = ""
-            parts = [p for p in cur.split(os.pathsep) if p]
-            if any(os.path.normcase(p) == os.path.normcase(d) for p in parts):
-                return  # already on PATH
-            winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ,
-                              os.pathsep.join(parts + [d]))
-        try:  # nudge already-open shells to reload the environment
-            import ctypes
-            ctypes.windll.user32.SendMessageTimeoutW(
-                0xFFFF, 0x1A, 0, "Environment", 0, 1000, ctypes.byref(ctypes.c_ulong()))
-        except Exception:
-            pass
+
+        on_path = any(os.path.normcase(p) == os.path.normcase(d)
+                      for p in os.environ.get("PATH", "").split(os.pathsep))
+        if on_path:
+            return  # already resolvable; nothing to do
+
+        added_reg = _add_to_user_path(d)
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + d
-        warn(f"Registered '{d}' on your PATH — open a new terminal and `zone` works everywhere.")
+
+        # Drop a launcher into an already-on-PATH dir for no-reload resolution.
+        shim_made = False
+        shim_dir = _writable_user_dir_on_path(exclude=d)
+        if shim_dir:
+            try:
+                with open(os.path.join(shim_dir, "zone.cmd"), "w", encoding="ascii") as fh:
+                    fh.write(_ZONE_CMD)
+                shim_made = True
+            except Exception:
+                pass
+
+        if shim_made:
+            ok("`zone` is now on your PATH — works in this terminal right away.")
+        elif added_reg:
+            warn(f"Registered '{d}' on your PATH — open a new terminal to use `zone`.")
     except Exception:
         pass
 
