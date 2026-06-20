@@ -18,7 +18,8 @@ a single command.
 - **One-command setup** — `zone init` scaffolds a runnable starter app instantly.
 - **Native development window** — `zone start` runs the app in a desktop window with live logs (no browser).
 - **Live reload** — `zone start --reload` picks up code and template edits automatically.
-- **Self-contained** — `zone` has no dependencies of its own; each app's packages live in its zone's `.venv`.
+- **Self-contained zones** — like a frappe bench, `zone init` installs the CLI into the zone's own `.venv`, pinning each zone to the version it was created with.
+- **No dependencies of its own** — `zone` is pure stdlib; each app's packages live in its zone's `.venv`.
 
 ---
 
@@ -37,7 +38,7 @@ a single command.
 
 ## Installation
 
-Fetch and install the CLI from GitHub (no clone needed):
+Install the CLI **globally**, once, from GitHub (no clone needed):
 
 ```bat
 py -m pip install "git+https://github.com/ZonalTech/Zone.git"
@@ -46,6 +47,11 @@ py -m zone --version
 
 The one-time `py -m zone --version` registers `zone` on your `PATH`. After that,
 use plain `zone` commands from any directory.
+
+This global install is the bootstrapper — much like `pip install frappe-bench`.
+From there, `zone init <name>` installs the CLI into that zone's own `.venv`, so
+each zone is self-contained and pinned to the version it was created with
+(pass `--no-cli` to opt out and use the global CLI for a zone instead).
 
 ---
 
@@ -97,7 +103,7 @@ by:
 
 | Command | Description |
 |---------|-------------|
-| `zone init [NAME] [--app-name N] [--no-app]` | Create a zone (`.venv` plus a starter app, unless `--no-app`). |
+| `zone init [NAME] [--app-name N] [--no-app] [--no-cli]` | Create a zone (`.venv` with the zone CLI installed into it, plus a starter app). `--no-cli` skips installing the CLI into the `.venv`; `--no-app` skips the starter app. |
 | `zone new NAME` | Scaffold another minimal application into `apps/`. |
 | `zone get REPO [NAME] [--branch B]` | Clone an application from GitHub into `apps/`. |
 | `zone setup [APP] [--seed] [--skip-install]` | `.env`, dependencies, database, and optional sample data. |

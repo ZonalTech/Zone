@@ -20,6 +20,14 @@ How it locates a zone and app:
     app. Commands that run app code re-exec inside the zone's shared `.venv`, so
     zones stay isolated.
 
+Self-contained zones (like a frappe bench):
+    Install `zone` once, globally, from GitHub
+    (`pip install git+https://github.com/ZonalTech/Zone.git`). `zone init` then
+    installs the CLI into the new zone's `.venv`, so each zone carries — and is
+    pinned to — the exact CLI version it was built with. App-code commands
+    re-exec through that venv-local copy (the `.venv`'s own `zone` script),
+    falling back to this file only for zones that predate the behaviour.
+
 Run `zone help` (or `zone <command> -h`) for the full command list.
 """
 import argparse
@@ -35,7 +43,7 @@ try:
 except Exception:
     pass
 
-ZONE_VERSION = "1.0.11"
+ZONE_VERSION = "1.1.0"
 # Where the zone CLI itself lives, for version checks and `zone upgrade`.
 ZONE_REPO = os.environ.get("ZONE_REPO", "ZonalTech/Zone")
 
@@ -134,6 +142,32 @@ def venv_python(zone):
     return os.path.join(zone, ".venv", "bin", "python")
 
 
+def venv_zone_script(zone):
+    """Path to the `zone` console script installed *inside* the zone's .venv.
+
+    Present once the CLI has been installed into the zone (by `zone init`, like a
+    frappe bench's env). Its existence is how we know the zone carries its own
+    copy of the CLI and can run `python -m zone` from the venv.
+    """
+    if os.name == "nt":
+        return os.path.join(zone, ".venv", "Scripts", "zone.exe")
+    return os.path.join(zone, ".venv", "bin", "zone")
+
+
+def venv_has_zone(zone):
+    return bool(zone) and os.path.isfile(venv_zone_script(zone))
+
+
+def zone_meta(zone):
+    """Read the zone's .zone/zone.json marker as a dict ({} if missing/unreadable)."""
+    import json
+    try:
+        with open(os.path.join(zone, ZONE_MARKER), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
 def has_venv(zone):
     return bool(zone) and os.path.isfile(venv_python(zone))
 
@@ -157,7 +191,17 @@ def reexec_in_venv(zone, app_dir, argv):
     if not os.path.isfile(py):
         die("This zone has no virtual environment yet — run `zone init` (or `zone setup`).")
     env = dict(os.environ, ZONE_IN_VENV="1")
-    proc = subprocess.Popen([py, os.path.abspath(__file__), *argv], cwd=app_dir, env=env)
+    # Prefer the CLI installed *inside* this zone's .venv (self-contained, pinned
+    # to the version the zone was created with — like a frappe bench's env). Run
+    # its console script by path, not `-m zone`: `-m` would prepend the app dir to
+    # sys.path and could import an app's own zone.py instead of the CLI. Fall back
+    # to this script file for zones whose venv has no own copy (older zones, or an
+    # install that couldn't add it).
+    if venv_has_zone(zone):
+        cmd = [venv_zone_script(zone), *argv]
+    else:
+        cmd = [py, os.path.abspath(__file__), *argv]
+    proc = subprocess.Popen(cmd, cwd=app_dir, env=env)
     try:
         return proc.wait()
     except KeyboardInterrupt:
@@ -393,6 +437,13 @@ def cmd_upgrade(args):
         head(f"pip install --upgrade {url}")
         if subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", url]) != 0:
             die("pip upgrade failed.")
+    # If we're inside a zone, keep its self-contained venv copy in sync too, so
+    # the next `zone start`/etc. (which re-execs through the venv) runs the new
+    # version rather than the one the zone was created with.
+    zone = find_zone()
+    if zone and venv_has_zone(zone):
+        head("Updating the zone-local CLI in this zone's .venv")
+        _ensure_zone_in_venv(zone, force=True)
     ok("Upgrade complete. Run `zone --version` to confirm "
        "(reopen the terminal if the version looks unchanged).")
 
@@ -400,6 +451,49 @@ def cmd_upgrade(args):
 def _base_python():
     """The interpreter used to *build* a zone's venv (zone's own Python)."""
     return sys.executable
+
+
+def _zone_install_source():
+    """Where to install the zone CLI from when seeding a zone's .venv.
+
+    A source checkout (zone.py sitting next to pyproject.toml) installs from that
+    local tree, so dev zones get the in-progress CLI. Anything else — the usual
+    `pip install git+…` global install — pulls the canonical repo. Mirrors the
+    source-vs-Git split that `zone upgrade` already makes.
+    """
+    src = os.path.dirname(os.path.abspath(__file__))
+    if os.path.isfile(os.path.join(src, "pyproject.toml")):
+        return src
+    return f"git+https://github.com/{ZONE_REPO}.git"
+
+
+def _ensure_zone_in_venv(zone, py=None, force=False):
+    """Install the zone CLI into the zone's own .venv (idempotent).
+
+    This is what makes a zone self-contained, the way `bench init` installs
+    frappe-bench into a bench's env: the zone carries the exact CLI it was built
+    with, and `zone` commands re-exec via that copy (see `reexec_in_venv`) rather
+    than depending on the global install staying where it was. Best-effort —
+    warns and leaves the global CLI as the fallback if the install fails.
+    """
+    py = py or venv_python(zone)
+    if not os.path.isfile(py):
+        return False
+    if venv_has_zone(zone) and not force:
+        return True
+    # Honour a `zone init --no-cli` opt-out so later setup/install don't quietly
+    # re-add the CLI. (Pre-1.1.0 zones have no such key, so they still backfill.)
+    if not force and zone_meta(zone).get("cli_in_venv") is False:
+        return False
+    src = _zone_install_source()
+    head("Installing the zone CLI into the zone .venv")
+    args = ["-q"] + (["--upgrade"] if force else []) + [src]
+    if subprocess.call([py, "-m", "pip", "install", *args]) == 0 and venv_has_zone(zone):
+        ok("zone CLI installed into the zone .venv (self-contained).")
+        return True
+    warn("Couldn't install the zone CLI into the .venv; "
+         "venv commands will fall back to the global CLI.")
+    return False
 
 
 def cmd_init(args):
@@ -415,7 +509,9 @@ def cmd_init(args):
     if not is_zone_root(zone):
         import json
         with open(os.path.join(zone, ZONE_MARKER), "w", encoding="utf-8") as fh:
-            json.dump({"zone": name, "created_with": ZONE_VERSION}, fh, indent=2)
+            json.dump({"zone": name, "created_with": ZONE_VERSION,
+                       "cli_source": _zone_install_source(),
+                       "cli_in_venv": not args.no_cli}, fh, indent=2)
     # Build the zone's shared virtualenv (apps install their deps into it).
     py = venv_python(zone)
     if os.path.isfile(py):
@@ -427,6 +523,10 @@ def cmd_init(args):
             die("Could not create .venv (is the base Python's venv module available?).")
         subprocess.call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
         ok("Created .venv")
+    # Install the zone CLI into the zone's own .venv so the zone is self-contained
+    # (like `bench init` installing frappe-bench into a bench's env), unless opted out.
+    if not args.no_cli:
+        _ensure_zone_in_venv(zone, py)
     ok(f"Zone ready at {zone}")
 
     # Scaffold a starter app into apps/ (named after the zone) unless opted out,
@@ -622,9 +722,14 @@ def _pip_install_venv(pip_args, cwd=None, quiet=False):
 
 
 def _ensure_zone_venv():
-    """Make sure the zone venv exists (it normally does, from `zone init`)."""
+    """Make sure the zone venv exists (it normally does, from `zone init`).
+
+    Also backfills the zone-local CLI for zones created before that became the
+    default, so older zones become self-contained on their next setup/install.
+    """
     py = venv_python(ZONE)
     if os.path.isfile(py):
+        _ensure_zone_in_venv(ZONE, py)
         return py
     head("Creating the zone virtual environment (.venv)")
     if subprocess.call([_base_python(), "-m", "venv", venv_dir(ZONE)]) != 0 \
@@ -632,6 +737,7 @@ def _ensure_zone_venv():
         die("Could not create .venv (is the base Python's venv module available?).")
     subprocess.call([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
     ok("Created .venv")
+    _ensure_zone_in_venv(ZONE, py)
     return py
 
 
@@ -1404,6 +1510,9 @@ def build_parser():
     sp.add_argument("--app-name", help="Name for the starter app (default: the zone name).")
     sp.add_argument("--no-app", action="store_true",
                     help="Don't scaffold a starter app (empty apps/).")
+    sp.add_argument("--no-cli", action="store_true",
+                    help="Don't install the zone CLI into the zone's .venv "
+                         "(use the global CLI for this zone instead).")
 
     sp = add("get", cmd_get, "Clone an app from GitHub into this zone's apps/.",
              aliases=("clone",), needs_app=False, needs_venv=False)
